@@ -188,6 +188,13 @@ def train(tr,va,te, model: RWBert):
         print(f"VAL:  AUC: {va_auc:0.4f}, AP:  {va_ap:0.4f}")
         print(f"TEST: AUC: {auc:0.4f}, AP:  {ap:0.4f}")
 
+    with open(f'{OUT_DIR}/snapshot-ft_results_{FNAME}_{SIZE}_wl{WALK_LEN}.txt', 'a') as f:
+        f.write('#'*20 + '\n')
+        f.write(f'BEST SCORES\n')
+        f.write('#'*20 + '\n')
+        f.write(f"VAL:  AUC: {va_auc:0.4f}, AP:  {va_ap:0.4f}\n")
+        f.write(f"TEST: AUC: {auc:0.4f}, AP:  {ap:0.4f}\n")
+
     return best_te
 
 def special(tr,va,te, model,sd,tag,out_dir):
@@ -225,8 +232,12 @@ if __name__ == '__main__':
     arg.add_argument('--device', type=int, default=0)
     arg.add_argument('--walk-len', type=int, default=4)
     arg.add_argument('--optc', action='store_true')
+    arg.add_argument('--optc-ts', action='store_true')
+    arg.add_argument('--optc-argus', action='store_true')
     arg.add_argument('--unsw', action='store_true')
     arg.add_argument('--argus', action='store_true')
+    arg.add_argument('--argus-ts', action='store_true')
+    arg.add_argument('--dirty', action='store_true')
     arg.add_argument('--trw', action='store_true')
     arg.add_argument('--best', action='store_true')
     arg.add_argument('--from-random', action='store_true')
@@ -244,7 +255,10 @@ if __name__ == '__main__':
     DEVICE = args.device if args.device >= 0 else 'cpu'
     WALK_LEN = args.walk_len
     DATASET = 'optc' if args.optc else 'unsw' if args.unsw \
-            else 'lanl14argus' if args.argus else 'unknown'
+            else 'optc-argus' if args.optc_argus \
+            else 'lanl14argus' if args.argus else 'lanl14argus-ts' if args.argus_ts \
+            else 'lanl14argus-dirtyts' if args.dirty \
+            else 'optc-ts' if args.optc_ts else 'unknown'
     WORKERS = 16
     EVAL_EVERY = 1000
 
@@ -334,7 +348,7 @@ if __name__ == '__main__':
     te = TRWSampler(te, walk_len=WALK_LEN, batch_size=EVAL_BS, edge_features=edge_features)
     te.label = label
 
-    if DATASET == 'lanl14argus':
+    if DATASET.startswith('lanl14argus'):
         DELTA = 60*60
         SNAPSHOTS = tr.ts.unique().tolist()
         WORKERS = 1
@@ -369,7 +383,7 @@ if __name__ == '__main__':
         if WALK_LEN > 16:
             WORKERS = 4
 
-    elif DATASET == 'optc':
+    elif DATASET.startswith('optc'):
         DELTA = 60*60*24
         SNAPSHOTS = (tr.ts // DELTA).unique().tolist()[:5]
         WORKERS = 1

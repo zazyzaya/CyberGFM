@@ -124,6 +124,14 @@ def build_tgraph():
     # agree on node mappings
     x = torch.zeros(len(node_map), 1)
 
+    '''
+    import pickle
+    with open('unsw_node_map.pkl', 'wb+') as f:
+        print("Dumping node map")
+        pickle.dump(node_map, f)
+        exit()
+    '''
+
     idxptr = [0]
     col = []
     ts = []

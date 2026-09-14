@@ -13,7 +13,7 @@ from sklearn.metrics import \
 
 SPEEDTEST = True
 PATIENCE = 25
-DEVICE = 2
+DEVICE = 1
 
 class Euler(nn.Module):
     def __init__(self, in_dim, hidden, emb_dim, device='cpu', gin=False):
@@ -144,15 +144,21 @@ def preprocess(g, uq=False):
 if __name__ == '__main__':
     ap = ArgumentParser()
     ap.add_argument('--lanl', action='store_true')
+    ap.add_argument('--lanl-ts', action='store_true')
     ap.add_argument('--unsw', action='store_true')
     ap.add_argument('--optc', action='store_true')
+    ap.add_argument('--optc-argus', action='store_true')
     ap.add_argument('--gin', action='store_true')
     args = ap.parse_args()
 
     if args.lanl:
         ds = 'lanl14argus'
+    elif args.lanl_ts:
+        ds = 'lanl14argus-ts'
     elif args.unsw:
         ds = 'unsw'
+    elif args.optc_argus:
+        ds = 'optc-argus'
     else: # args.optc:
         ds = 'optc'
     #else:

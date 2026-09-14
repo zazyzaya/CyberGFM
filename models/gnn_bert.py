@@ -185,36 +185,41 @@ class RWBert(GraphBertForMaskedLM):
         walks[walks < 0] += GNNEmbedding.OFFSET + self.config.num_nodes
         return super().modified_fwd(walks, masks, targets, attn_mask, return_loss=return_loss, skip_cls=skip_cls)
 
-class RWBertFT(torch.nn.Module): 
+class RWBertFT(torch.nn.Module):
     def __init__(self, config, sd, device='cpu', out_dim=1, from_random=False):
         super().__init__()
         self.fm = RWBert(config)
-        
-        if not from_random: 
+        self.out_dim = out_dim
+
+        if not from_random:
             self.fm.load_state_dict(sd)
-            
+
         self.fm = self.fm.to(device)
 
         self.cls = nn.Sequential(
             torch.nn.Linear(config.hidden_size, config.hidden_size, device=device),
-            torch.nn.ReLU(), 
+            torch.nn.ReLU(),
             torch.nn.Linear(config.hidden_size, out_dim, device=device)
         )
 
         self.config = config
         self.device = device
 
-    def predict(self, walks,attn_mask,tgt_mask): 
+    def predict(self, walks,attn_mask,tgt_mask):
         out = self.fm.modified_fwd(walks, tgt_mask, None, attn_mask, return_loss=False, skip_cls=True)
         out = out[tgt_mask] # [src1, dst1, src2, dst2, ...]
         #out = out.reshape(out.size(0)//2, -1) # [[src,dst],[src,dst], ...]
         return self.cls(out)
 
-    def forward(self, rw,attn,tgt_mask, target): 
+    def forward(self, rw,attn,tgt_mask, target):
         pred = self.predict(rw,attn,tgt_mask)
-        loss_fn = nn.BCEWithLogitsLoss()
+        if self.out_dim == 1:
+            loss_fn = nn.BCEWithLogitsLoss()
+        else:
+            loss_fn = nn.CrossEntropyLoss()
+
         loss = loss_fn(pred,target)
-        return loss 
+        return loss
 
 
 class RWBertFT_Old(torch.nn.Module):

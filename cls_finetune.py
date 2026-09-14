@@ -29,7 +29,6 @@ from utils import reindex
 SPEEDTEST = False
 
 DEVICE = 0
-WARMUP_E = 9.6  # Epochs
 EPOCHS = 32    # Epochs
 LR = 3e-4
 
@@ -282,7 +281,7 @@ def train(tr,va,te, model: RWBertFT):
     #opt = SOAP(model.parameters(), LR, mode='adam')
 
     updates_per_epoch = tr.col.size(0) / BS
-    warmup_stop = int(updates_per_epoch * WARMUP_E)
+    warmup_stop = int(updates_per_epoch * (EPOCHS / 3.75))
     total_steps = int(updates_per_epoch * EPOCHS)
     sched = Scheduler(opt, warmup_stop, total_steps)
 
@@ -308,7 +307,7 @@ def train(tr,va,te, model: RWBertFT):
     })
 
     e = 0
-    for e in range(5):
+    for e in range(EPOCHS):
         for samp in tr.edge_iter():
             if tr.edge_features:
                 src,dst,ts,ef = samp
@@ -413,12 +412,21 @@ def train(tr,va,te, model: RWBertFT):
         print(f"VAL:  AUC: {va_auc:0.4f}, AP:  {va_ap:0.4f}")
         print(f"TEST: AUC: {auc:0.4f}, AP:  {ap:0.4f}")
 
+    with open(OUT_F, 'a') as f:
+        f.write('#'*20 + '\n')
+        f.write(f'BEST SCORES\n')
+        f.write('#'*20 + '\n')
+        f.write(f"VAL:  AUC: {va_auc:0.4f}, AP:  {va_ap:0.4f}\n")
+        f.write(f"TEST: AUC: {auc:0.4f}, AP:  {ap:0.4f}\n")
+
 if __name__ == '__main__':
     arg = ArgumentParser()
     arg.add_argument('--size', default='tiny')
     arg.add_argument('--device', type=int, default=0)
     arg.add_argument('--walk-len', type=int, default=4)
     arg.add_argument('--optc', action='store_true')
+    arg.add_argument('--optc-ts', action='store_true')
+    arg.add_argument('--optc-argus', action='store_true')
     arg.add_argument('--unsw', action='store_true')
     arg.add_argument('--argus', action='store_true')
     arg.add_argument('--trw', action='store_true')
@@ -430,6 +438,7 @@ if __name__ == '__main__':
     arg.add_argument('--out-dir', default='')
     arg.add_argument('--poison', default=0, type=int)
     arg.add_argument('--ignore-edge-feats', action='store_true')
+    arg.add_argument('--epochs', default=32, type=int)
     args = arg.parse_args()
     print(args)
 
@@ -439,10 +448,12 @@ if __name__ == '__main__':
     SIZE = args.size
     DEVICE = args.device if args.device >= 0 else 'cpu'
     WALK_LEN = args.walk_len
-    DATASET = 'optc' if args.optc else 'unsw' if args.unsw \
+    DATASET = 'optc' if args.optc else 'optc-ts' if args.optc_ts \
+            else 'optc-argus' if args.optc_argus else 'unsw' if args.unsw \
             else 'lanl14argus' if args.argus else 'unknown'
     WORKERS = 16
     COMPRESS = False
+    EPOCHS = args.epochs
 
     edge_features = (args.unsw or args.argus) and not args.ignore_edge_feats
 
@@ -511,8 +522,9 @@ if __name__ == '__main__':
             sd = torch.load(f'pretrained/static/{DATASET}/rw_bert_{DATASET}_{SIZE}.pt', weights_only=True)
 
     temporal_str = 'rwft' if args.trw else 'static'
-    OUT_DIR = f'{HOME}/{DATASET}' if args.out_dir is None else args.out_dir
-    OUT_F = f'{OUT_DIR}/{RAND}{temporal_str}{bi_fname}_results_{FNAME}_{SIZE}_wl{WALK_LEN}{args.tag}.txt'
+    epoch_str = '' if EPOCHS == 32 else f'-{EPOCHS}e'
+    OUT_DIR = f'{HOME}/{DATASET}' if not args.out_dir else args.out_dir
+    OUT_F = f'{OUT_DIR}/{RAND}{temporal_str}{bi_fname}_results_{FNAME}_{SIZE}_wl{WALK_LEN}{epoch_str}{args.tag}.txt'
 
     va = torch.load(f'data/{DATASET}_tgraph_va.pt', weights_only=False)
     va = TRWSampler(va, walk_len=WALK_LEN, batch_size=EVAL_BS, edge_features=edge_features)
@@ -533,7 +545,7 @@ if __name__ == '__main__':
         SNAPSHOTS = tr.ts.unique().tolist()
         WORKERS = 1
 
-    elif DATASET == 'optc':
+    elif DATASET.startswith('optc'):
         DELTA = 60*60*24
         SNAPSHOTS = (tr.ts // DELTA).unique().tolist()[:5]
         WORKERS = 1
@@ -552,7 +564,7 @@ if __name__ == '__main__':
         max_position_embeddings = 1024 if args.argus else 512
     )
     model = RWBertFT(config, sd, device=DEVICE, from_random=args.from_random)
-    model.fm.requires_grad = False
+    #model.fm.requires_grad = False
 
     train(tr,va,te, model)
 

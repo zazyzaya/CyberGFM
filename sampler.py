@@ -20,41 +20,41 @@ class TRWSampler():
         if 'num_tokens' in data.keys():
             self.num_tokens = data.num_tokens
 
-        else: 
+        else:
             self.num_tokens = data.x.size(0)
             if edge_features:
                 self.num_tokens += self.edge_attr.max() + 1
 
-        # Used for KG LP 
-        if 'filter_ptr' in data.keys(): 
-            self.filter_ptr = data.filter_ptr 
-            self.filter_col = data.filter_col 
-            self.filter_rel = data.filter_rel 
+        # Used for KG LP
+        if 'filter_ptr' in data.keys():
+            self.filter_ptr = data.filter_ptr
+            self.filter_col = data.filter_col
+            self.filter_rel = data.filter_rel
 
         self.edge_features = edge_features
         self.walk_len = walk_len
         self.n_walks = n_walks
         self.batch_size = batch_size
         self.device = device
-        self.trim_missing = False 
+        self.trim_missing = False
 
         self.min_ts = None
         self.max_ts = None
 
-    def to(self, device): 
+    def to(self, device):
         self.rowptr = self.rowptr.to(device)
         self.col = self.col.to(device)
         self.ts = self.ts.to(device)
         if self.edge_features:
             self.edge_attr = self.edge_attr.to(device)
 
-        self.device = device 
+        self.device = device
         torch.cuda.empty_cache()
 
     def rw(self, batch, n_walks=1, min_ts=None, max_ts=None, reverse=False, trim_missing=True, walk_len=None):
-        if walk_len is not None: 
+        if walk_len is not None:
             wl = walk_len
-        else: 
+        else:
             wl = self.walk_len
 
         batch = batch.repeat(n_walks)
@@ -69,10 +69,10 @@ class TRWSampler():
             eids = eids.flip(1)
 
         pad = eids == -1
-        
+
         if not reverse:
             walks[:, 1:][pad] = GNNEmbedding.PAD
-        else: 
+        else:
             walks[:, :-1][pad] = GNNEmbedding.PAD
 
         if self.edge_features:
@@ -220,9 +220,9 @@ def find_src(col_idx, idxptr):
 
 class RWSampler(TRWSampler):
     def rw(self, batch, n_walks=1, trim_missing=True, walk_len=None, reverse=False, **kwargs):
-        if walk_len is not None: 
+        if walk_len is not None:
             wl = walk_len
-        else: 
+        else:
             wl = self.walk_len
 
         batch = batch.repeat(n_walks)
@@ -237,10 +237,10 @@ class RWSampler(TRWSampler):
             eids = eids.flip(1)
 
         pad = eids == -1
-        
+
         if not reverse:
             walks[:, 1:][pad] = GNNEmbedding.PAD
-        else: 
+        else:
             walks[:, :-1][pad] = GNNEmbedding.PAD
 
         if self.edge_features:
@@ -264,7 +264,4 @@ class RWSampler(TRWSampler):
             walks = walks[:, whole_col]
             walks = walks[whole_row]
 
-        
-
         return walks
-        

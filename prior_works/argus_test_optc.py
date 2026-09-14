@@ -15,9 +15,9 @@ from sklearn.metrics import \
 
 from argus_opt import SOAP
 
-SPEEDTEST = True 
+SPEEDTEST = False
 EPOCHS = 100
-DEVICE = 1
+DEVICE = 3
 
 def squared_loss(margin, t): return (margin - t)** 2
 def squared_hinge_loss(margin, t): return torch.max(margin - t, torch.zeros_like(t)) ** 2
@@ -145,9 +145,9 @@ class Argus(nn.Module):
         self.c3 = GCNConv(h_dim, h_dim, add_self_loops=True).to(device)
         nn4 = nn.Sequential(nn.Linear(edge_dim, 8, device=device), nn.ReLU(), # lanl: 3 or 10; optc: 5
                             nn.Linear(8, h_dim * h_dim, device=device))
-        
+
         self.c4 = NNConv(h_dim, h_dim, nn4, aggr='mean').to(device)
-        
+
         self.rnn = GRU(h_dim, h_dim, z_dim).to(device)
 
         self.decode_mlp = nn.Sequential(
@@ -225,7 +225,7 @@ class Argus(nn.Module):
                 continue
 
             ns = torch.randint(0, zs.size(1), ps.size())
-            
+
             # Switching pos and neg bc I think the original was backward?
             t_index = torch.arange(0, ps.size(1), dtype=torch.int64, device=self.device).detach()
             neg_pred = self.decode(ps, zs[i])
@@ -323,12 +323,12 @@ def train(tr,va,te):
     best = (0,0,0)
     best_cheating = (0,0)
     PATIENCE = 5
-    BS = 64
+    BS = 256
     print(len(tr.edge_index))
     no_progress = 0
     for e in range(EPOCHS):
-        fwd_time=bwd_time=loss_time=step_time = 0 
-        for i in range(len(tr.edge_index) // BS): 
+        fwd_time=bwd_time=loss_time=step_time = 0
+        for i in range(len(tr.edge_index) // BS):
             st_i = i*BS
             en_i = (i+1)*BS
 
@@ -357,9 +357,9 @@ def train(tr,va,te):
             step_time += time.time() - st
             print(f' ({((time.time() - st) / 60):0.2f} mins)')
 
-            print(f'[{e}] Loss: {loss.item():0.4f}')
+            print(f'[{e}: {i}/{len(tr.edge_index) // BS}] Loss: {loss.item():0.4f}')
 
-        if SPEEDTEST: 
+        if SPEEDTEST:
             with open('argus_speedtest.csv', 'a') as f:
                 f.write(f'OpTC,{fwd_time},{loss_time},{bwd_time},{step_time}\n')
             exit()
@@ -371,7 +371,7 @@ def train(tr,va,te):
             labels = torch.zeros(pos.size(0)+neg.size(0))
             labels[pos.size(0):] = 1
 
-            preds = torch.cat([pos,neg]).numpy()
+            preds = torch.cat([pos,neg]).cpu().numpy()
             labels = labels.numpy()
 
             va_auc = auc_score(labels, preds)
@@ -387,9 +387,9 @@ def train(tr,va,te):
                 ).sum(dim=1)
                 preds.append(pred)
 
-            preds = torch.sigmoid(torch.cat(preds)).numpy()
-            y = torch.cat(te.label).clamp(0,1).numpy()
-            cnt = torch.cat(te.cnts).numpy()
+            preds = torch.sigmoid(torch.cat(preds)).cpu().numpy()
+            y = torch.cat(te.label).clamp(0,1).cpu().numpy()
+            cnt = torch.cat(te.cnts).cpu().numpy()
 
             auc = auc_score(y, preds, sample_weight=cnt)
             ap = ap_score(y, preds, sample_weight=cnt)
@@ -415,17 +415,20 @@ def train(tr,va,te):
 
             print(json.dumps({'auc': best[1], 'ap': best[2], 'auc_last': auc, 'ap_last': ap, 'auc_snooped': best_cheating[0], 'ap_snooped': best_cheating[1]}, indent=1))
 
+    with open('tmp_argus.txt', 'a') as f:
+        f.write(json.dumps({'auc': best[1], 'ap': best[2], 'auc_last': auc, 'ap_last': ap, 'auc_snooped': best_cheating[0], 'ap_snooped': best_cheating[1]}, indent=1))
+
     print(f"Best: AUC {best[1]:0.4f}, AP {best[2]:0.4f}")
     return {'auc': best[1], 'ap': best[2], 'auc_last': auc, 'ap_last': ap, 'auc_snooped': best_cheating[0], 'ap_snooped': best_cheating[1]}
 
 if __name__ == '__main__':
     if not os.path.exists('tmp/optc_tr.pt'):
-        tr = torch.load('../data/optc_tgraph_tr.pt', weights_only=False)
-        tr.ts //= 3600
-        va = torch.load('../data/optc_tgraph_va.pt', weights_only=False)
-        va.ts //= 3600
-        te = torch.load('../data/optc_tgraph_te.pt', weights_only=False)
-        te.ts //= 3600
+        tr = torch.load('../data/optc-ts_tgraph_tr.pt', weights_only=False)
+        tr.ts //= 360
+        va = torch.load('../data/optc-ts_tgraph_va.pt', weights_only=False)
+        va.ts //= 360
+        te = torch.load('../data/optc-ts_tgraph_te.pt', weights_only=False)
+        te.ts //= 360
 
         ts = tr.ts.unique()
 
@@ -433,18 +436,18 @@ if __name__ == '__main__':
         va = to_snapshots(va, ts)
         te = to_snapshots(te, ts)
 
-        torch.save(tr, 'tmp/optc_tr.pt')
-        torch.save(va, 'tmp/optc_va.pt')
-        torch.save(te, 'tmp/optc_te.pt')
+        torch.save(tr, 'tmp/optc-ts_tr.pt')
+        torch.save(va, 'tmp/optc-ts_va.pt')
+        torch.save(te, 'tmp/optc-ts_te.pt')
 
     else:
-        tr = torch.load('tmp/optc_tr.pt', weights_only=False)
-        va = torch.load('tmp/optc_va.pt', weights_only=False)
-        te = torch.load('tmp/optc_te.pt', weights_only=False)
+        tr = torch.load('tmp/optc-ts_tr.pt', weights_only=False)
+        va = torch.load('tmp/optc-ts_va.pt', weights_only=False)
+        te = torch.load('tmp/optc-ts_te.pt', weights_only=False)
 
     best = [train(tr,va,te) for _ in range(10)]
     df = pd.DataFrame(best)
     df.loc['mean'] = df.mean()
     df.loc['sem'] = df.sem()
 
-    df.to_csv('argus_results_optc_only_tr_times.csv')
+    df.to_csv('argus_results_optc-ts.csv')

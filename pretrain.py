@@ -160,6 +160,10 @@ if __name__ == '__main__':
     arg.add_argument('--optc', action='store_true')
     arg.add_argument('--unsw', action='store_true')
     arg.add_argument('--argus', action='store_true')
+    arg.add_argument('--tsplit', action='store_true')
+    arg.add_argument('--dirty', action='store_true')
+    arg.add_argument('--optc-tsplit', action='store_true')
+    arg.add_argument('--optc-argus', action='store_true')
     arg.add_argument('--delta', type=int, default=-1)
     arg.add_argument('--trw', action='store_true')
     arg.add_argument('--tr-size', type=float, default=1.)
@@ -183,18 +187,21 @@ if __name__ == '__main__':
         'baseline': SimpleNamespace(H=768, L=12, MINI_BS=256)
     }[SIZE]
 
-    DATASET = 'optc' if args.optc else 'unsw' if args.unsw \
-        else 'lanl14argus' if args.argus else 'unknown'
+    DATASET = 'optc' if args.optc else 'optc-ts' if args.optc_tsplit \
+        else 'optc-argus' if args.optc_argus else 'unsw' if args.unsw \
+        else 'lanl14argus' if args.argus else 'lanl14argus-ts' if args.tsplit \
+        else 'lanl14argus-dirtyts' if args.dirty \
+        else 'unknown'
 
     MINI_BS = params.MINI_BS
 
     edge_features = (args.unsw or args.argus) and not args.ignore_edge_feats
     print(DATASET)
 
-    if DATASET == 'optc':
+    if DATASET.startswith('optc'):
         MINI_BS = 1035
 
-    if args.argus:
+    if args.argus or args.tsplit:
         WALK_LEN = 4 if not args.ignore_edge_feats else 64 # 64 tokens
         MINI_BS = 512 if not args.ignore_edge_feats else 1024
 
@@ -287,6 +294,9 @@ if __name__ == '__main__':
         WORKERS = 16
         EVAL_EVERY = 14
 
+        if (args.tsplit or args.dirty) and args.trw:
+            EVAL_EVERY *= 5
+
 
     elif DATASET == 'unsw':
         WARMUP_T = 10 ** 7 # Tokens (originally 10**9)
@@ -302,16 +312,16 @@ if __name__ == '__main__':
         elif SIZE == 'mini':
             g.n_walks = 10
 
-    elif DATASET == 'optc':
+    elif DATASET.startswith('optc'):
         WARMUP_T = 10 ** 7 # Tokens (originally 10**9)
         TOTAL_T = 10 ** 8
 
-        DELTA = 60*60*24 if args.delta == -1 else args.delta
+        DELTA = 60*60 if args.delta == -1 else args.delta
         SNAPSHOTS = (tr.ts // DELTA).unique(sorted=True).tolist()#[:5]
         CHECKPOINT = len(SNAPSHOTS)
         WORKERS = 16
         EVAL_BS = 2048*2
-        EVAL_EVERY = 500
+        EVAL_EVERY = 100
 
         if SIZE == 'med':
             EVAL_BS = 2048
@@ -355,5 +365,7 @@ if __name__ == '__main__':
         delta=DELTA, workers=WORKERS,
         eval_bs=EVAL_BS, downsample=DOWNSAMPLE
     )
+
+    print(EVAL_EVERY)
     model = BERT(config).to(DEVICE)
     train(g,model)

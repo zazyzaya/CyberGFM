@@ -1,6 +1,6 @@
-import os 
+import os
 import pandas as pd
-import time 
+import time
 import torch
 from torch import nn
 from torch.optim import Adam
@@ -11,9 +11,9 @@ from sklearn.metrics import \
     roc_auc_score as auc_score, \
     average_precision_score as ap_score
 
-SPEEDTEST = True
+SPEEDTEST = False
 EPOCHS = 15 # Validation is no help. Gets decent scores quickly, then overfits
-DEVICE = 1
+DEVICE = 3
 
 class Euler(nn.Module):
     def __init__(self, in_dim, hidden, emb_dim, device='cpu'):
@@ -89,30 +89,30 @@ def train(tr,va,te):
         model.train()
         opt.zero_grad()
 
-        st = time.time() 
+        st = time.time()
         zs = model.forward(tr.x, tr.edge_index)
-        fwd_time = time.time() - st 
+        fwd_time = time.time() - st
 
         st = time.time()
         loss = calc_loss(zs, tr.edge_index)
-        loss_time = time.time() - st 
+        loss_time = time.time() - st
 
         st = time.time()
         loss.backward()
-        bwd_time = time.time() - st 
-        
+        bwd_time = time.time() - st
+
         st = time.time()
         opt.step()
-        step_time = time.time() - st 
+        step_time = time.time() - st
 
-        if SPEEDTEST: 
+        if SPEEDTEST:
             with open('euler_speedtest.csv', 'a') as f:
                 f.write(f'OpTC,{fwd_time},{loss_time},{bwd_time},{step_time}\n')
             exit()
 
         print(f'[{e}] Loss: {loss.item():0.4f}')
 
-        if SPEEDTEST: 
+        if SPEEDTEST:
             with open('argus_speedtest.csv', 'a') as f:
                 f.write(f'LANL,{fwd_time},{loss_time},{bwd_time},{step_time}\n')
             exit()
@@ -137,8 +137,8 @@ def train(tr,va,te):
             preds = torch.sigmoid(torch.cat(preds))
             y = torch.cat(te.label).clamp(0,1)
 
-            auc = auc_score(y, preds.cpu())
-            ap = ap_score(y, preds.cpu())
+            auc = auc_score(y.cpu(), preds.cpu())
+            ap = ap_score(y.cpu(), preds.cpu())
             print(f'\tTe AUC: {auc:0.4f}, AP: {ap:0.4f}', end='', flush=True)
 
             if va_loss < best[0]:
@@ -151,12 +151,12 @@ def train(tr,va,te):
     return {'auc': best[1], 'ap': best[2]}
 
 if __name__ == '__main__':
-    if not os.path.exists('tmp/euler_optc_te.pt'):
-        tr = torch.load('../data/optc_tgraph_tr.pt', weights_only=False)
+    if not os.path.exists('tmp/euler_optc-ts_te.pt'):
+        tr = torch.load('../data/optc-ts_tgraph_tr.pt', weights_only=False)
         tr.ts //= 3600
-        va = torch.load('../data/optc_tgraph_va.pt', weights_only=False)
+        va = torch.load('../data/optc-ts_tgraph_va.pt', weights_only=False)
         va.ts //= 3600
-        te = torch.load('../data/optc_tgraph_te.pt', weights_only=False)
+        te = torch.load('../data/optc-ts_tgraph_te.pt', weights_only=False)
         te.ts //= 3600
 
         ts = tr.ts.unique()
@@ -165,18 +165,18 @@ if __name__ == '__main__':
         va = to_snapshots(va, ts)
         te = to_snapshots(te, ts)
 
-        torch.save(tr, 'tmp/euler_optc_tr.pt')
-        torch.save(va, 'tmp/euler_optc_va.pt')
-        torch.save(te, 'tmp/euler_optc_te.pt')
-    
-    else: 
-        tr = torch.load('tmp/euler_optc_tr.pt', weights_only=False)
-        va = torch.load('tmp/euler_optc_va.pt', weights_only=False)
-        te = torch.load('tmp/euler_optc_te.pt', weights_only=False)
+        torch.save(tr, 'tmp/euler_optc-ts_tr.pt')
+        torch.save(va, 'tmp/euler_optc-ts_va.pt')
+        torch.save(te, 'tmp/euler_optc-ts_te.pt')
+
+    else:
+        tr = torch.load('tmp/euler_optc-ts_tr.pt', weights_only=False)
+        va = torch.load('tmp/euler_optc-ts_va.pt', weights_only=False)
+        te = torch.load('tmp/euler_optc-ts_te.pt', weights_only=False)
 
 
     best = [train(tr,va,te) for _ in range(10)]
     df = pd.DataFrame(best)
     print(df.mean())
     print(df.sem())
-    df.to_csv('euler_results.csv')
+    df.to_csv('euler_results-optc-ts.csv')

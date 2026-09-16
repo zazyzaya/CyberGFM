@@ -62,6 +62,7 @@ if __name__ == '__main__':
     ap.add_argument('--out-dir')
     ap.add_argument('--tag', default='')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--pretrain-tag', default='', help='--tag used when pretraining, e.g. _wl32')
     ap.add_argument('--speedtest', action='store_true',
                     help='train one epoch without evaluation, write timings to latency/, exit')
     args = ap.parse_args()
@@ -85,7 +86,7 @@ if __name__ == '__main__':
     model = RWBert(bert_config(name, tr, args.size))
     if not args.from_random:
         path = args.model_fname or pretrained_path(name, args.size, args.trw, args.poison,
-                                                   args.tr_size, best=args.best_pretrained)
+                                                   args.tr_size, best=args.best_pretrained, tag=args.pretrain_tag)
         print('Loading', path)
         model.load_state_dict(torch.load(path, weights_only=True))
     model = model.to(device)
@@ -97,7 +98,7 @@ if __name__ == '__main__':
     scorer = make_lp_scorer(model, tr, args.walk_len, delta, args.score)
 
     out_dir = args.out_dir or f'results/lp-{"temporal" if args.trw else "static"}/{name}'
-    stem = (f'{"rand_init_" if args.from_random else ""}lp{run_tag(args.poison, args.tr_size)}'
+    stem = (f'{"rand_init_" if args.from_random else ""}lp{run_tag(args.poison, args.tr_size)}{args.pretrain_tag}'
             f'_{args.size}_wl{args.walk_len}{args.tag}')
     tracker = ResultTracker(f'{out_dir}/{stem}.csv', args.select_by)
     print(f'{name}: edge features={edge_features}, delta={delta}, mini_bs={mini_bs} x{accum}, '

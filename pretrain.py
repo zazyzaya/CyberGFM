@@ -38,7 +38,10 @@ def defaults(kind, size, edge_features, temporal):
         d = dict(total_tokens=1e8, walk_len=64, eval_every=500, mini_bs=1024, eval_bs=2048,
                  n_walks={'tiny': 20, 'mini': 10}.get(size, 1))
     else:  # optc
-        d = dict(total_tokens=1e8, walk_len=64, eval_every=100, mini_bs=1024,
+        # OpTC has 1,034 nodes. With mini_bs=1024 every epoch ends in a 10-walk batch, and since
+        # 1024 needs no accumulation that tiny batch becomes its own full-size optimizer step
+        # (half of all updates). 1035 keeps each epoch in one batch, as the original script did.
+        d = dict(total_tokens=1e8, walk_len=64, eval_every=100, mini_bs=1035,
                  eval_bs=2048 if size in ('med', 'baseline') else 4096, n_walks=1)
     if size == 'baseline':
         d['mini_bs'] = min(d['mini_bs'], 256)
@@ -66,6 +69,7 @@ if __name__ == '__main__':
     ap.add_argument('--tr-size', type=float, default=1.0)
     ap.add_argument('--log-out', help='defaults to the pretrained/ checkpoint directory')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--tag', default='', help='checkpoint suffix for pretraining variants, e.g. _wl32')
     ap.add_argument('--speedtest', action='store_true',
                     help='train one epoch without evaluation or checkpoints, write timings to latency/, exit')
     args = ap.parse_args()
@@ -83,12 +87,12 @@ if __name__ == '__main__':
     warmup = total // 10
     accum = math.ceil(BS / mini_bs)
 
-    ckpt = pretrained_path(name, args.size, args.trw, args.poison, args.tr_size)
-    best_ckpt = pretrained_path(name, args.size, args.trw, args.poison, args.tr_size, best=True)
+    ckpt = pretrained_path(name, args.size, args.trw, args.poison, args.tr_size, tag=args.tag)
+    best_ckpt = pretrained_path(name, args.size, args.trw, args.poison, args.tr_size, best=True, tag=args.tag)
     log_dir = args.log_out or os.path.dirname(ckpt)
     os.makedirs(os.path.dirname(ckpt), exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-    stem = f'{"t" if args.trw else ""}rw_bert_{name}{run_tag(args.poison, args.tr_size)}_{args.size}'
+    stem = f'{"t" if args.trw else ""}rw_bert_{name}{run_tag(args.poison, args.tr_size)}{args.tag}_{args.size}'
 
     tr_data = load_train_graph(name, edge_features, args.poison, args.tr_size)
     tr = make_sampler(tr_data, args.trw, edge_features, walk_len, mini_bs, device)
@@ -104,14 +108,17 @@ if __name__ == '__main__':
     opt = AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 
     # Evaluation uses src + edge features only (walk_len=1), so delta is unused
-    scorer = make_lp_scorer(model, tr, walk_len=1, delta=DAY)
+    scorer = make_lp_scorer(model, tr, walk_len=1, delta=DAY, score='nll')
 
     train_log = open(f'{log_dir}/{stem}_log.csv', 'w')
-    train_log.write('updates,tokens,loss,lr,mask_rate,seconds\n')
+    train_log.write('updates,tokens,loss,lr,mask_rate,seq_len,walk_len,seconds\n')
     eval_log = open(f'{log_dir}/{stem}_eval.csv', 'w')
     eval_log.write('epoch,updates,tokens,te_auc,te_ap,va_auc,va_ap\n')
 
+    # Walks interleave F feature tokens per hop: n0 f.. n1 f.. n2 -> tokens = nodes + (nodes - 1) * F
+    feat_dim = tr.edge_attr.size(1) if edge_features else 0
     tokens = updates = micro = epoch = 0
+    win_tokens = win_walks = 0  # for average sequence / walk length since the last log line
     best = -float('inf')
     start = time.time()
     timer = SpeedTimer(args.speedtest, device)
@@ -126,7 +133,10 @@ if __name__ == '__main__':
                 continue
 
             walks, masks, targets, attn = tok.mask(mb)
-            tokens += int((walks != PAD).sum())
+            n_tok = int((walks != PAD).sum())
+            tokens += n_tok
+            win_tokens += n_tok
+            win_walks += walks.size(0)
             timer.lap('samp')
 
             loss = model.modified_fwd(walks, masks, targets, attn)
@@ -152,9 +162,13 @@ if __name__ == '__main__':
 
             if updates % LOG_EVERY == 0:
                 el = time.time() - start
+                seq_len = win_tokens / max(1, win_walks)
+                walk_len = (seq_len + feat_dim) / (1 + feat_dim)
+                win_tokens = win_walks = 0
                 print(f'[{updates}-{epoch}] loss {loss.item():.4f} lr {lr:.2e} '
-                      f'mask {tok.mask_rate:.3f} tokens {tokens:.2e} {el:.0f}s')
-                train_log.write(f'{updates},{tokens},{loss.item()},{lr},{tok.mask_rate},{el}\n')
+                      f'mask {tok.mask_rate:.3f} tokens {tokens:.2e} '
+                      f'seq len {seq_len:.1f} (walk len {walk_len:.2f}) {el:.0f}s')
+                train_log.write(f'{updates},{tokens},{loss.item()},{lr},{tok.mask_rate},{seq_len},{walk_len},{el}\n')
                 train_log.flush()
 
             if tokens >= total:

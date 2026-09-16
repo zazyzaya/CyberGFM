@@ -58,10 +58,11 @@ def run_tag(poison_pct=0, tr_size=1.0):
     return tag
 
 
-def pretrained_path(name, size, temporal, poison_pct=0, tr_size=1.0, best=False):
+def pretrained_path(name, size, temporal, poison_pct=0, tr_size=1.0, best=False, tag=''):
+    '''tag distinguishes pretraining variants of the same dataset/size, e.g. "_wl32".'''
     kind = 'temporal' if temporal else 'static'
     prefix = 'trw_bert' if temporal else 'rw_bert'
-    return (f'pretrained/{kind}/{name}/{prefix}_{name}{run_tag(poison_pct, tr_size)}_{size}'
+    return (f'pretrained/{kind}/{name}/{prefix}_{name}{run_tag(poison_pct, tr_size)}{tag}_{size}'
             f'{"-best" if best else ""}.pt')
 
 
@@ -132,6 +133,24 @@ def bert_config(name, tr, size):
 # ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
+def left_align(walk):
+    '''
+    Move PAD tokens to the end of each row, keeping the order of real tokens.
+
+    Context walks are reversed so they end at the source node, which leaves
+    short walks padded at the front. Pretraining walks start at position 0, so
+    left-aligning puts fine-tuning tokens on the positions pretraining trained.
+    '''
+    order = torch.argsort((walk == PAD).int(), dim=1, stable=True)
+    return walk.gather(1, order)
+
+
+def last_real(x, walk):
+    '''x[:, i] at each row's last non-PAD position (for left-aligned sequences).'''
+    idx = (walk != PAD).sum(dim=1) - 1
+    return x[torch.arange(walk.size(0), device=walk.device), idx]
+
+
 def context(tr, src, ts, delta, use_walk):
     '''
     Random walk ending at src, used as context for scoring an edge out of src.
@@ -172,7 +191,7 @@ def lp_inputs(tr, src, dst, ts, ef, walk_len, delta):
     rw = context(tr, src, ts, delta, use_walk=walk_len > 1)
     parts = [rw] + ([ef] if ef is not None else [])
     parts.append(torch.full((rw.size(0), 1), MASK, device=rw.device, dtype=rw.dtype))
-    walk = torch.cat(parts, dim=1)
+    walk = left_align(torch.cat(parts, dim=1))
     return walk, walk == MASK, dst, walk != PAD
 
 
@@ -181,6 +200,24 @@ def make_lp_scorer(model, tr, walk_len, delta, score='sigmoid'):
     def score_fn(src, dst, ts, ef):
         walk, mask, tgt, attn = lp_inputs(tr, src, dst, ts, ef, walk_len, delta)
         logits = model.modified_fwd(walk, mask, tgt, attn, return_loss=False).logits[mask]
+        idx = torch.arange(dst.size(0), device=dst.device)
+        if score == 'nll':
+            return -torch.log_softmax(logits.float(), dim=-1)[idx, dst]
+        return 1 - torch.sigmoid(logits[idx, dst])
+    return score_fn
+
+
+def causal_lp_inputs(tr, src, ts, ef, walk_len, delta):
+    '''[walk ... src, (src->dst edge features)]; a causal model predicts dst as the next token.'''
+    rw = context(tr, src, ts, delta, use_walk=walk_len > 1)
+    return left_align(torch.cat([rw, ef], dim=1)) if ef is not None else left_align(rw)
+
+
+def make_causal_lp_scorer(model, tr, walk_len, delta, score='sigmoid'):
+    '''Anomaly score for edges from a GPT model (higher = more anomalous).'''
+    def score_fn(src, dst, ts, ef):
+        walk = causal_lp_inputs(tr, src, ts, ef, walk_len, delta)
+        logits = last_real(model.logits(walk), walk)
         idx = torch.arange(dst.size(0), device=dst.device)
         if score == 'nll':
             return -torch.log_softmax(logits.float(), dim=-1)[idx, dst]

@@ -12,7 +12,7 @@ import math
 import torch
 from torch.optim import AdamW
 
-from common import (DAY, MASK, PAD, ResultTracker, SpeedTimer, bert_config, context, dataset_kind, evaluate,
+from common import (DAY, MASK, PAD, ResultTracker, SpeedTimer, bert_config, context, dataset_kind, evaluate, left_align,
                     load_eval_samplers, load_train_graph, make_sampler, pretrained_path,
                     random_edges, run_tag, seed_everything, uses_edge_features, warmup_linear)
 from models.gnn_bert import RWBertFT
@@ -24,7 +24,7 @@ def cls_inputs(tr, src, dst, ts, ef, walk_len, delta):
     rw = context(tr, src, ts, delta, use_walk=walk_len > 0)
     parts = [rw] + ([ef] if ef is not None else [])
     parts += [dst.unsqueeze(-1), torch.full((rw.size(0), 1), MASK, device=rw.device, dtype=rw.dtype)]
-    walk = torch.cat(parts, dim=1)
+    walk = left_align(torch.cat(parts, dim=1))
     return walk, walk != PAD, walk == MASK
 
 
@@ -53,6 +53,7 @@ if __name__ == '__main__':
     ap.add_argument('--out-dir')
     ap.add_argument('--tag', default='')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--pretrain-tag', default='', help='--tag used when pretraining, e.g. _wl32')
     ap.add_argument('--speedtest', action='store_true',
                     help='train one epoch without evaluation, write timings to latency/, exit')
     args = ap.parse_args()
@@ -75,7 +76,7 @@ if __name__ == '__main__':
     sd = None
     if not args.from_random:
         path = args.model_fname or pretrained_path(name, args.size, args.trw, args.poison,
-                                                   args.tr_size, best=args.best_pretrained)
+                                                   args.tr_size, best=args.best_pretrained, tag=args.pretrain_tag)
         print('Loading', path)
         sd = torch.load(path, weights_only=True)
     model = RWBertFT(bert_config(name, tr, args.size), sd, device=device, from_random=args.from_random)
@@ -91,7 +92,7 @@ if __name__ == '__main__':
         return 1 - torch.sigmoid(out).squeeze(-1)
 
     out_dir = args.out_dir or f'results/cls-{"temporal" if args.trw else "static"}/{name}'
-    stem = (f'{"rand_init_" if args.from_random else ""}cls{run_tag(args.poison, args.tr_size)}'
+    stem = (f'{"rand_init_" if args.from_random else ""}cls{run_tag(args.poison, args.tr_size)}{args.pretrain_tag}'
             f'_{args.size}_wl{args.walk_len}{args.tag}')
     tracker = ResultTracker(f'{out_dir}/{stem}.csv', args.select_by)
     print(f'{name}: edge features={edge_features}, delta={delta}, mini_bs={mini_bs} x{accum}, '

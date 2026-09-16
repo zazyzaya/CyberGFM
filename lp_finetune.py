@@ -265,7 +265,7 @@ if __name__ == '__main__':
     HOME = f'results/lp-{"temporal" if args.trw else "static"}/'
     OUT_DIR = f'{HOME}/{DATASET}' if not args.out_dir else args.out_dir
 
-    edge_features = (args.unsw or args.argus) and not args.ignore_edge_feats
+    edge_features = (args.unsw or args.argus or args.dirty or args.ts) and not args.ignore_edge_feats
 
     params = {
         'tiny': SimpleNamespace(H=128, L=2, MINI_BS=1024),

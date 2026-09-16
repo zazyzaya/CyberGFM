@@ -15,7 +15,9 @@ class TRWSampler():
         self.data = data
 
         self.num_nodes = data.x.size(0)
-        self.edge_attr = data.edge_attr.to(device)
+
+        ea = data.get('edge_attr', None)
+        self.edge_attr = ea.to(device) if ea is not None else None
 
         if 'num_tokens' in data.keys():
             self.num_tokens = data.num_tokens
@@ -103,38 +105,13 @@ class TRWSampler():
         for b in batches:
             yield self.rw(b, min_ts=self.min_ts, max_ts=self.max_ts, n_walks=self.n_walks)
 
-    def _single_iter_old(self, b, shuffled=True):
-        # Keep in ascending order so ts and idxptr are still in proper order
-        # should be relatively fast since batch-size is fairly low
-        if shuffled:
-            b = b.sort().values
-
-        dst = self.col[b]
-        ts = self.ts[b]
-
-        # Overhead is too high. Goes to abt 15 mins w/ threads, unclear how long w procs (too much memcopy)
-        # Worst case O(|V| + |b|) -> O(n)
-        src = []
-        cur_src = 0
-        cur_max = self.rowptr[cur_src+1]
-        for b_ in b:
-            while cur_max < b_:
-                cur_src += 1
-                cur_max  = self.rowptr[cur_src+1]
-            src.append(cur_src)
-
-        src = torch.tensor(src, device=self.device)
-        return src,dst,ts
-
     def _single_iter(self, b, shuffled=True):
         src = self.data.src[b.to(self.data.src.device)].to(self.device)
         dst = self.col[b]
         ts = self.ts[b]
-
         if self.edge_features:
-            return src,dst,ts, self.edge_attr[b]
-
-        return src,dst,ts
+            return src, dst, ts, self.edge_attr[b] + self.num_nodes
+        return src, dst, ts
 
     def edge_iter(self, shuffle=True, return_index=False):
         if shuffle:

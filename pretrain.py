@@ -80,6 +80,9 @@ def train(g: RWSampler, model: BERT):
     processed_tokens = 0
     best = 0
 
+    ACCUM = -(-BS // MINI_BS)   # ceil
+    acc_tokens = 0
+
     e = 0
     while processed_tokens < TOTAL_T:
         st = time.time()
@@ -99,7 +102,6 @@ def train(g: RWSampler, model: BERT):
                 opt_en = time.time() - opt_st
                 sched.step()
 
-                processed_tokens += tokens
                 t.set_mask_rate(min(1, (processed_tokens / WARMUP_T)))
 
                 updates += 1
@@ -123,6 +125,7 @@ def train(g: RWSampler, model: BERT):
                 print(f'[{updates}-{e}] {loss:0.6f} (lr: {lr:0.2e}, mask rate {t.mask_rate:0.4f} tokens: {processed_tokens:0.2e}, seq len: {tokens/MINI_BS:0.2f} {en-st:0.2f}s)')
                 st = time.time()
 
+            processed_tokens += tokens
             if processed_tokens >= TOTAL_T:
                 break
 
@@ -195,7 +198,7 @@ if __name__ == '__main__':
 
     MINI_BS = params.MINI_BS
 
-    edge_features = (args.unsw or args.argus) and not args.ignore_edge_feats
+    edge_features = (args.unsw or args.argus or args.dirty or args.ts) and not args.ignore_edge_feats
     print(DATASET)
 
     if DATASET.startswith('optc'):
@@ -221,7 +224,7 @@ if __name__ == '__main__':
             print(f"Injecting {args.poison}% of malicious edges")
 
         te = torch.load(f'data/{DATASET}_tgraph_te.pt', weights_only=False)
-        tr = poison(tr.cpu(),te.cpu(),args.poison,  edge_features, DATASET)
+        tr = poison(tr.cpu(), te.cpu(), edge_features, args.poison / 100, DATASET)
 
     # Training set size ablation study
     if args.tr_size != 1:

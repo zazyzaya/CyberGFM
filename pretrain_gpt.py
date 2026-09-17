@@ -16,9 +16,9 @@ import time
 import torch
 from torch.optim import AdamW
 
-from common import (DAY, PAD, SIZES, SpeedTimer, dataset_kind, evaluate, load_eval_samplers,
+from common import (DAY, HOUR, PAD, SIZES, SpeedTimer, dataset_kind, evaluate, load_eval_samplers,
                     load_train_graph, make_causal_lp_scorer, make_sampler, pretrained_path,
-                    run_tag, seed_everything, uses_edge_features)
+                    run_tag, save_checkpoint, seed_everything, uses_edge_features)
 from models.hugging_gpt import GPT, gpt_config
 from pretrain import BS, LOG_EVERY, defaults, lr_at
 
@@ -38,6 +38,14 @@ if __name__ == '__main__':
     ap.add_argument('--n-tokens', type=float, help='training length in units of 1e8 tokens')
     ap.add_argument('--mini-bs', type=int)
     ap.add_argument('--eval-every', type=int, help='epochs between evaluations; 0 disables')
+    ap.add_argument('--eval-walk-len', type=int, default=1,
+                    help='context walk length for the periodic evaluation. The default (1) scores '
+                         '[src, features, MASK] with no walk, which the model never sees in training; '
+                         'match the fine-tuning walk length for a more meaningful proxy.')
+    ap.add_argument('--eval-delta', type=int, help='temporal window for eval walks (default: 1h LANL, 1d OpTC, 0 UNSW)')
+    ap.add_argument('--snapshot-every', type=float,
+                    help='also keep a checkpoint every N x 1e8 tokens, for plotting fine-tuned '
+                         'performance against pretraining length')
     ap.add_argument('--poison', type=int, default=0)
     ap.add_argument('--tr-size', type=float, default=1.0)
     ap.add_argument('--log-out')
@@ -56,6 +64,8 @@ if __name__ == '__main__':
     walk_len = args.walk_len or cfg['walk_len']
     mini_bs = args.mini_bs or cfg['mini_bs']
     eval_every = cfg['eval_every'] if args.eval_every is None else args.eval_every
+    eval_delta = args.eval_delta if args.eval_delta is not None else {'lanl': HOUR, 'unsw': 0, 'optc': DAY}[kind]
+    snapshot_every = int(args.snapshot_every * 1e8) if args.snapshot_every else 0
     total = int(args.n_tokens * 1e8) if args.n_tokens else int(cfg['total_tokens'])
     warmup = total // 10
     accum = math.ceil(BS / mini_bs)
@@ -79,7 +89,7 @@ if __name__ == '__main__':
     config = gpt_config(tr.num_tokens, p.H, p.L, 1024 if kind == 'lanl' else 512)
     model = GPT(config).to(device)
     opt = AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
-    scorer = make_causal_lp_scorer(model, tr, walk_len=1, delta=DAY)
+    scorer = make_causal_lp_scorer(model, tr, walk_len=args.eval_walk_len, delta=eval_delta)
 
     train_log = open(f'{log_dir}/{stem}_log.csv', 'w')
     train_log.write('updates,tokens,loss,lr,seq_len,walk_len,seconds\n')
@@ -89,6 +99,7 @@ if __name__ == '__main__':
     # Walks interleave F feature tokens per hop: n0 f.. n1 f.. n2 -> tokens = nodes + (nodes - 1) * F
     feat_dim = tr.edge_attr.size(1) if edge_features else 0
     tokens = updates = micro = epoch = 0
+    next_snapshot = snapshot_every
     win_tokens = win_walks = 0  # for average sequence / walk length since the last log line
     best = -float('inf')
     start = time.time()
@@ -138,6 +149,13 @@ if __name__ == '__main__':
                 train_log.write(f'{updates},{tokens},{loss.item()},{lr},{seq_len},{walk_len},{el}\n')
                 train_log.flush()
 
+            if snapshot_every and tokens >= next_snapshot:
+                snap = ckpt.replace('.pt', f'-snap{round(tokens / 1e6)}Mtok.pt')
+                save_checkpoint(model.state_dict(), snap)
+                print(f'snapshot -> {snap}')
+                while next_snapshot <= tokens:
+                    next_snapshot += snapshot_every
+
             if tokens >= total:
                 break
             timer.mark()
@@ -149,9 +167,9 @@ if __name__ == '__main__':
             raise SystemExit
 
         epoch += 1
-        torch.save(model.state_dict(), ckpt)
 
         if eval_every and epoch % eval_every == 0:
+            save_checkpoint(model.state_dict(), ckpt)  # latest; saved with each evaluation, not every epoch
             model.eval()
             torch.cuda.empty_cache()
             m = evaluate(scorer, tr, va, te, cfg['eval_bs'], seed=args.seed)
@@ -161,7 +179,7 @@ if __name__ == '__main__':
             eval_log.flush()
             if m['va_auc'] > best:
                 best = m['va_auc']
-                torch.save(model.state_dict(), best_ckpt)
+                save_checkpoint(model.state_dict(), best_ckpt)
 
-    torch.save(model.state_dict(), ckpt)
+    save_checkpoint(model.state_dict(), ckpt)
     print(f'Done: {tokens:.2e} tokens, {updates} updates, {time.time() - start:.0f}s -> {ckpt}')

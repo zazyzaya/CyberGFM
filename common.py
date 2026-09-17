@@ -3,6 +3,7 @@ Shared pieces for pretrain.py, lp_finetune.py and cls_finetune.py:
 dataset defaults, training-graph loading (poisoning / subsets), random-walk
 context construction, random negative edges, evaluation and result tracking.
 '''
+import atexit
 import json
 import os
 import time
@@ -14,6 +15,7 @@ from tqdm import tqdm
 from transformers import BertConfig
 
 from fast_auc import fast_auc, fast_ap
+from metrics import detection_metrics
 from models.gnn_bert import GNNEmbedding
 from poison_datasets import poison
 from sampler import TRWSampler, RWSampler
@@ -241,9 +243,11 @@ def score_split(score_fn, split, tr, bs, desc):
 
 
 @torch.no_grad()
-def evaluate(score_fn, tr, va, te, bs, seed=0):
+def evaluate(score_fn, tr, va, te, bs, seed=0, recall=0.5):
     '''
-    Test: labeled test edges.
+    Test: labeled test edges. Besides AUC and AP, reports metrics that stay comparable across
+    splits with different attack rates (see metrics.py): AP lift over random ranking, and
+    precision and benign edges flagged per day at `recall`.
     Validation: held-out real edges (label 0) vs. an equal number of random edges (label 1).
     '''
     te_pred = score_split(score_fn, te, tr, bs, 'test')
@@ -259,28 +263,90 @@ def evaluate(score_fn, tr, va, te, bs, seed=0):
     va_pred = torch.cat([tp, tn]).numpy()
     va_y = np.concatenate([np.ones(n), np.zeros(n)])
 
-    return dict(
-        te_auc=fast_auc(te_y, te_pred.numpy()), te_ap=fast_ap(te_y, te_pred.numpy()),
-        va_auc=fast_auc(va_y, va_pred), va_ap=fast_ap(va_y, va_pred),
-    )
+    te_ap = fast_ap(te_y, te_pred.numpy())
+    out = dict(te_auc=fast_auc(te_y, te_pred.numpy()), te_ap=te_ap)
+    out.update(detection_metrics(te_y, te_pred.numpy(), te_ap, ts=te.ts.cpu().numpy(), recall=recall))
+    out.update(va_auc=fast_auc(va_y, va_pred), va_ap=fast_ap(va_y, va_pred))
+    return out
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists, owned by another user
+        return True
+    return True
 
 
 class ResultTracker:
-    '''Writes one CSV row per evaluation and remembers the best by validation AUC (or AP).'''
+    '''
+    Writes one CSV row per evaluation and remembers the best by validation AUC (or AP).
+
+    Holds a lock file ({path}.lock, containing the owner's PID) for the whole run, so a second
+    process with the same settings fails immediately instead of truncating the CSV and
+    interleaving its rows. Locks left by processes that no longer exist are taken over.
+    '''
 
     def __init__(self, path, select_by='auc'):
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         self.path = path
         self.key = f'va_{select_by}'
         self.best = None
-        with open(path, 'w') as f:
-            f.write('epoch,updates,te_auc,te_ap,va_auc,va_ap\n')
+        self.lock = f'{path}.lock'
+        self._acquire_lock()
+        atexit.register(self._release_lock)
+        self.columns = None  # taken from the first metrics dict, so new metrics need no changes here
+        open(path, 'w').close()
+
+    def _acquire_lock(self):
+        for _ in range(2):
+            try:
+                fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    with open(self.lock) as f:
+                        owner = int(f.read().strip() or -1)
+                except (OSError, ValueError):
+                    owner = -1
+                if owner > 0 and _pid_alive(owner):
+                    raise RuntimeError(
+                        f'{self.path} is being written by another running process (PID {owner}). '
+                        f'Stop it, or use a different --tag / --out-dir.')
+                os.remove(self.lock)  # stale lock from a dead process
+                continue
+            with os.fdopen(fd, 'w') as f:
+                f.write(str(os.getpid()))
+            return
+        raise RuntimeError(f'Could not acquire {self.lock}')
+
+    def _release_lock(self):
+        try:
+            with open(self.lock) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(self.lock)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _describe(m):
+        extra = ''
+        if 'te_ap_lift' in m:
+            r = next((k[len('te_prec_r'):] for k in m if k.startswith('te_prec_r')), None)
+            extra = f' lift {m["te_ap_lift"]:.1f}x'
+            if r is not None:
+                extra += f', @{r}% recall: prec {m[f"te_prec_r{r}"]:.4f}, FP/day {m[f"te_fp_day_r{r}"]:.1f}'
+        return (f'TEST AUC {m["te_auc"]:.4f} AP {m["te_ap"]:.4f}{extra} | '
+                f'VAL AUC {m["va_auc"]:.4f} AP {m["va_ap"]:.4f}')
 
     def log(self, epoch, updates, m):
         with open(self.path, 'a') as f:
-            f.write(f'{epoch},{updates},{m["te_auc"]},{m["te_ap"]},{m["va_auc"]},{m["va_ap"]}\n')
-        print(f'[epoch {epoch}] TEST AUC {m["te_auc"]:.4f} AP {m["te_ap"]:.4f} | '
-              f'VAL AUC {m["va_auc"]:.4f} AP {m["va_ap"]:.4f}')
+            if self.columns is None:
+                self.columns = list(m)
+                f.write(','.join(['epoch', 'updates'] + self.columns) + '\n')
+            f.write(','.join([str(epoch), str(updates)] + [str(m.get(c, '')) for c in self.columns]) + '\n')
+        print(f'[epoch {epoch}] {self._describe(m)}')
 
         improved = self.best is None or m[self.key] > self.best[2][self.key]
         if improved:
@@ -292,11 +358,11 @@ class ResultTracker:
             print('No evaluations were run.')
             return
         e, _, m = self.best
-        msg = (f'BEST (by {self.key}, epoch {e}): TEST AUC {m["te_auc"]:.4f} AP {m["te_ap"]:.4f} | '
-               f'VAL AUC {m["va_auc"]:.4f} AP {m["va_ap"]:.4f}')
+        msg = f'BEST (by {self.key}, epoch {e}): {self._describe(m)}'
         print('#' * 20 + '\n' + msg)
         with open(self.path, 'a') as f:
             f.write('# ' + msg + '\n')
+        self._release_lock()
 
 
 def warmup_linear(opt, warmup_steps, total_steps):
@@ -305,6 +371,16 @@ def warmup_linear(opt, warmup_steps, total_steps):
             return step / max(1, warmup_steps)
         return max(1e-8, 1 - (step - warmup_steps) / max(1, total_steps - warmup_steps))
     return torch.optim.lr_scheduler.LambdaLR(opt, f)
+
+
+def save_checkpoint(state_dict, path):
+    '''
+    Write to a temporary file in the same directory, then rename over the target.
+    The rename is atomic, so a concurrent torch.load never sees a partially written file.
+    '''
+    tmp = f'{path}.tmp.{os.getpid()}'
+    torch.save(state_dict, tmp)
+    os.replace(tmp, path)
 
 
 def seed_everything(seed):

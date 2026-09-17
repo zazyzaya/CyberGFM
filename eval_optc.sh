@@ -31,11 +31,11 @@ done
 PT_WL=64
 WLS="1 2 4 8 16 32"
 PT_TAG="_wl${PT_WL}"
-SEEDS="0 1 2"
+SEEDS="3 4"
 
 echo "dataset=$DS device=$DEV ${TRW:-static} pretrain_walk_len=$PT_WL fine-tune walk lengths: $WLS"
 
-python pretrain.py --dataset "$DS" --device "$DEV" $TRW --walk-len $PT_WL --tag "$PT_TAG"
+#python pretrain.py --dataset "$DS" --device "$DEV" $TRW --walk-len $PT_WL --tag "$PT_TAG"
 
 for ckpt in final best; do
   flag=""

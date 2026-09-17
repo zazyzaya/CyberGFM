@@ -37,7 +37,7 @@ if __name__ == '__main__':
     ap.add_argument('--ignore-edge-feats', action='store_true')
     ap.add_argument('--walk-len', type=int, default=4)
     ap.add_argument('--delta', type=int, help='temporal walk window (seconds); default 1 day (0 for UNSW)')
-    ap.add_argument('--epochs', type=int, default=32)
+    ap.add_argument('--epochs', type=int, default=10)
     ap.add_argument('--warmup-epochs', type=float, help='default: epochs / 3.75')
     ap.add_argument('--eval-every', type=int, default=1, help='epochs')
     ap.add_argument('--lr', type=float, default=3e-4)

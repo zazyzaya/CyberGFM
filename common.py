@@ -122,7 +122,7 @@ def bert_config(name, tr, size):
     num_tokens = int(tr.num_tokens)
     p = SIZES[size]
     return BertConfig(
-        num_tokens + OFFSET,
+        vocab_size=num_tokens + OFFSET,
         hidden_size=p.H,
         num_hidden_layers=p.L,
         num_attention_heads=p.H // 64,

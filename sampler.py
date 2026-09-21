@@ -6,6 +6,9 @@ from joblib import Parallel, delayed
 
 from models.gnn_bert import GNNEmbedding
 
+import os
+LEGACY_EF_OFFSET = os.environ.get('LEGACY_EF_OFFSET') == '1'
+
 class TRWSampler():
     def __init__(self, data: Data, walk_len=64, n_walks=1, batch_size=64, device='cpu', edge_features=False):
         self.x = data.x
@@ -109,8 +112,11 @@ class TRWSampler():
         src = self.data.src[b.to(self.data.src.device)].to(self.device)
         dst = self.col[b]
         ts = self.ts[b]
+
         if self.edge_features:
-            return src, dst, ts, self.edge_attr[b] + self.num_nodes
+            offset = 0 if LEGACY_EF_OFFSET else self.num_nodes
+            return src, dst, ts, self.edge_attr[b] + offset
+
         return src, dst, ts
 
     def edge_iter(self, shuffle=True, return_index=False):

@@ -42,6 +42,7 @@ class TRWSampler():
         self.batch_size = batch_size
         self.device = device
         self.trim_missing = False
+        self._inv_cache = None
 
         self.min_ts = None
         self.max_ts = None
@@ -50,6 +51,11 @@ class TRWSampler():
         self.rowptr = self.rowptr.to(device)
         self.col = self.col.to(device)
         self.ts = self.ts.to(device)
+
+        # Will get pulled from the underlying data object
+        # and moved to the active device next time it's used
+        self._inv_cache = None
+
         if self.edge_features:
             self.edge_attr = self.edge_attr.to(device)
 
@@ -64,12 +70,20 @@ class TRWSampler():
 
         batch = batch.repeat(n_walks)
 
+
+        if reverse:
+            inv = self._get_inv()
+            rowptr, col, ts = inv['idxptr'], inv['col'], inv['ts']
+        else:
+            rowptr, col, ts = self.rowptr, self.col, self.ts
+
         walks,eids = temporal_rw(
-            self.rowptr, self.col, self.ts, batch.to(self.device),
+            rowptr, col, ts, batch.to(self.device),
             wl, min_ts=min_ts, max_ts=max_ts, reverse=reverse, return_edge_indices=True
         )
 
         if reverse:
+            eids = torch.where(eids >= 0, inv['perm'][eids.clamp(min=0)], eids)  # -> original edge ids
             walks = walks.flip(1)
             eids = eids.flip(1)
 
@@ -118,6 +132,39 @@ class TRWSampler():
             return src, dst, ts, self.edge_attr[b] + offset
 
         return src, dst, ts
+
+    def _get_inv(self):
+        '''
+        In-edge CSR for walking against edge direction, stored on the Data object as
+        self.data.inv and built on first use:
+            inv['col'][inv['idxptr'][v]:inv['idxptr'][v+1]]  sources of edges into v, sorted by ts
+            inv['ts']                                        their timestamps
+            inv['perm']                                      position in this order -> original edge id
+        Rebuilt if the graph's edges changed since it was built (e.g. subsetting).
+        Returns a copy on this sampler's device, cached until to() is called.
+        '''
+        if getattr(self, '_inv_cache', None) is not None:
+            return self._inv_cache
+
+        data = self.data
+        inv = data.inv if 'inv' in data.keys() else None
+        if inv is None or inv['col'].numel() != data.col.numel():
+            idxptr, col, ts = data.idxptr.cpu(), data.col.cpu(), data.ts.cpu()
+            n = idxptr.size(0) - 1
+            if 'src' in data.keys():
+                src = data.src.cpu()
+            else:
+                src = torch.arange(n).repeat_interleave(idxptr[1:] - idxptr[:-1])
+
+            perm = torch.argsort(ts, stable=True)
+            perm = perm[torch.argsort(col[perm], stable=True)]  # primary key dst, then ts
+            inv_ptr = torch.zeros(n + 1, dtype=torch.long)
+            inv_ptr[1:] = torch.bincount(col, minlength=n).cumsum(0)
+            inv = dict(idxptr=inv_ptr, col=src[perm], ts=ts[perm], perm=perm)
+            data.inv = inv
+
+        self._inv_cache = {k: v.to(self.device) for k, v in inv.items()}
+        return self._inv_cache
 
     def edge_iter(self, shuffle=True, return_index=False):
         if shuffle:
@@ -210,12 +257,19 @@ class RWSampler(TRWSampler):
 
         batch = batch.repeat(n_walks)
 
+        if reverse:
+            inv = self._get_inv()
+            rowptr, col = inv['idxptr'], inv['col']
+        else:
+            rowptr, col = self.rowptr, self.col
+
         walks,eids = torch.ops.torch_cluster.random_walk(
-            self.rowptr, self.col, batch.to(self.device),
+            rowptr, col, batch.to(self.device),
             wl, 1, 1
         )
 
         if reverse:
+            eids = torch.where(eids >= 0, inv['perm'][eids.clamp(min=0)], eids)
             walks = walks.flip(1)
             eids = eids.flip(1)
 

@@ -15,7 +15,7 @@ set -euo pipefail
 
 [ $# -gt 0 ] || { echo "Usage: [WLS=...] [SEEDS=...] [TAG=...] [SCRIPT=...] $0 <args for lp_finetune.py>" >&2; exit 1; }
 
-WLS=${WLS:-"1 2 4 8 16 32"}
+WLS=${WLS:-"1 2 4 8 16"}
 SEEDS=${SEEDS:-"0 1 2 3 4"}
 TAG=${TAG:-""}
 SCRIPT=${SCRIPT:-lp_finetune.py}

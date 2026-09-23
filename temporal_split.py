@@ -189,4 +189,5 @@ def temporally_partition_argus_optc_tgraph():
 
 
 if __name__ == '__main__':
-    temporally_split_dirty_lanl_tgraph()
+    temporally_split_dirty_lanl_tgraph(tr_days=8)
+    temporally_partition_lanl_tgraph()

@@ -151,7 +151,9 @@ if __name__ == '__main__':
 
             loss = model.modified_fwd(walks, masks, targets, attn)
             timer.lap('fwd')
-            (loss / accum).backward()
+            # Sum (don't average) gradients over micro-batches, as in the original code. With clipping
+            # at 5 this matters: averaging produced markedly worse checkpoints for downstream LP.
+            loss.backward()
             timer.lap('bwd')
 
             micro += 1

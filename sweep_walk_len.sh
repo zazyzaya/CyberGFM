@@ -27,7 +27,7 @@ for wl in $WLS; do
     echo "== walk-len $wl seed $seed | final checkpoint =="
     python "$SCRIPT" --walk-len "$wl" --seed "$seed" "$@" --tag "${TAG}_s${seed}"
 
-    echo "== walk-len $wl seed $seed | -best checkpoint =="
-    python "$SCRIPT" --walk-len "$wl" --seed "$seed" "$@" --best-pretrained --tag "${TAG}_best_s${seed}"
+    #echo "== walk-len $wl seed $seed | -best checkpoint =="
+    #python "$SCRIPT" --walk-len "$wl" --seed "$seed" "$@" --best-pretrained --tag "${TAG}_best_s${seed}"
   done
 done

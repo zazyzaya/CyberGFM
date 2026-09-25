@@ -153,18 +153,32 @@ def fmt_metric(name, mu, se):
     return fmt(mu, se)
 
 
+BASE_COLS = ['experiment', 'dataset', 'prefix', 'variant', 'walk_len', 'n', 'epochs', 'best_epoch']
+
+
+def _row_cells(r, how, show):
+    cells = [str(r[c]) for c in BASE_COLS[:-1]]
+    be = r.get('best_epoch') if how == 'best' else None
+    if be is None:
+        cells.append('')
+    elif isinstance(be, float) and math.isnan(be):
+        cells.append('-')
+    else:
+        cells.append(f'{be:.1f}')
+    cells += [fmt_metric(m, r.get(f'{how}_{m}', float('nan')), r.get(f'{how}_{m}_se', float('nan')))
+              for m in show]
+    return cells
+
+
 def print_table(table, how, select_key, show):
     title = 'FINAL EPOCH' if how == 'final' else f'BEST EPOCH BY {select_key.upper()}'
-    cols = ['experiment', 'dataset', 'prefix', 'variant', 'walk_len', 'n', 'epochs']
-    if how == 'best':
-        cols.append('best_epoch')
-    header = cols + list(show)
-    lines = []
-    for r in table:
-        cells = [str(r[c]) if c != 'best_epoch' else ('-' if math.isnan(r[c]) else f'{r[c]:.1f}') for c in cols]
-        cells += [fmt_metric(m, r.get(f'{how}_{m}', float('nan')), r.get(f'{how}_{m}_se', float('nan'))) for m in show]
-        lines.append(cells)
-    widths = [max(len(h), *(len(l[i]) for l in lines)) if lines else len(h) for i, h in enumerate(header)]
+    header = BASE_COLS + list(show)
+    lines = [_row_cells(r, how, show) for r in table]
+
+    # Size columns over both tables so FINAL and BEST line up with each other
+    both = lines + [_row_cells(r, 'best' if how == 'final' else 'final', show) for r in table]
+    widths = [max(len(h), *(len(l[i]) for l in both)) if both else len(h) for i, h in enumerate(header)]
+
     print(f'\n== {title} (mean ± standard error over seeds) ==')
     print('  '.join(h.ljust(w) for h, w in zip(header, widths)))
     prev = None

@@ -70,6 +70,58 @@ class TRWSampler():
 
         batch = batch.repeat(n_walks)
 
+        walks,eids = temporal_rw(
+            self.rowptr, self.col, self.ts, batch.to(self.device),
+            wl, min_ts=min_ts, max_ts=max_ts, reverse=reverse, return_edge_indices=True
+        )
+
+        if reverse:
+            walks = walks.flip(1)
+            eids = eids.flip(1)
+
+        pad = eids == -1
+
+        if not reverse:
+            walks[:, 1:][pad] = GNNEmbedding.PAD
+        else:
+            walks[:, :-1][pad] = GNNEmbedding.PAD
+
+        if self.edge_features:
+            edge_feats = self.edge_attr[eids] + self.num_nodes
+            edge_feats[pad] = GNNEmbedding.PAD
+            edge_feats = torch.cat([
+                edge_feats,
+                torch.full((edge_feats.size(0),1,edge_feats.size(2)), GNNEmbedding.PAD, device=edge_feats.device)
+            ], dim=1)
+
+            # Interleave nids and eids
+            walks = walks.unsqueeze(-1)
+            walks = torch.cat([walks, edge_feats], dim=-1).view(walks.size(0), -1)
+
+        pad = walks == GNNEmbedding.PAD
+        whole_col = ~torch.prod(pad, dim=0, dtype=torch.bool)
+        whole_row = ~torch.prod(pad, dim=1, dtype=torch.bool)
+
+        # If no walks went to full walk_len, trim them down to save mem
+        if trim_missing:
+            walks = walks[:, whole_col]
+            walks = walks[whole_row]
+
+        return walks
+
+    def rw_true_backward(self, batch, n_walks=1, min_ts=None, max_ts=None, reverse=False, trim_missing=True, walk_len=None):
+        '''
+        I realized that the reverse argument passed to temporal_rw just made the time stamps reversed, and
+        didn't reverse the direction of the walks, so I fixed that here. It made the results much worse...
+        Keeping the fixed code for posterity, but reversing the changes
+        '''
+        if walk_len is not None:
+            wl = walk_len
+        else:
+            wl = self.walk_len
+
+        batch = batch.repeat(n_walks)
+
 
         if reverse:
             inv = self._get_inv()
@@ -250,6 +302,53 @@ def find_src(col_idx, idxptr):
 
 class RWSampler(TRWSampler):
     def rw(self, batch, n_walks=1, trim_missing=True, walk_len=None, reverse=False, **kwargs):
+        if walk_len is not None:
+            wl = walk_len
+        else:
+            wl = self.walk_len
+
+        batch = batch.repeat(n_walks)
+
+        walks,eids = torch.ops.torch_cluster.random_walk(
+            self.rowptr, self.col, batch.to(self.device),
+            wl, 1, 1
+        )
+
+        if reverse:
+            walks = walks.flip(1)
+            eids = eids.flip(1)
+
+        pad = eids == -1
+
+        if not reverse:
+            walks[:, 1:][pad] = GNNEmbedding.PAD
+        else:
+            walks[:, :-1][pad] = GNNEmbedding.PAD
+
+        if self.edge_features:
+            edge_feats = self.edge_attr[eids] + self.num_nodes
+            edge_feats[pad] = GNNEmbedding.PAD
+            edge_feats = torch.cat([
+                edge_feats,
+                torch.full((edge_feats.size(0),1,edge_feats.size(2)), GNNEmbedding.PAD, device=edge_feats.device)
+            ], dim=1)
+
+            # Interleave nids and eids
+            walks = walks.unsqueeze(-1)
+            walks = torch.cat([walks, edge_feats], dim=-1).view(walks.size(0), -1)
+
+        pad = walks == GNNEmbedding.PAD
+        whole_col = ~torch.prod(pad, dim=0, dtype=torch.bool)
+        whole_row = ~torch.prod(pad, dim=1, dtype=torch.bool)
+
+        # If no walks went to full walk_len, trim them down to save mem
+        if trim_missing:
+            walks = walks[:, whole_col]
+            walks = walks[whole_row]
+
+        return walks
+
+    def rw_true_backward(self, batch, n_walks=1, trim_missing=True, walk_len=None, reverse=False, **kwargs):
         if walk_len is not None:
             wl = walk_len
         else:

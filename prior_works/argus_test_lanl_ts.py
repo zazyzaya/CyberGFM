@@ -2,15 +2,18 @@
 Argus on the dirty / scrubbed temporal LANL splits, for the poisoning comparison.
 
 argus_test_lanl.py builds every split's snapshots from the TRAINING timestamps, which only works
-for the random split where all splits share the same hours. Here train and test hours are disjoint,
-so snapshots are built per window, and test snapshots are scored with the trailing training
-snapshots fed in first so the GRU has history.
+for the random split where all splits share the same hours. Here train and test hours are disjoint.
 
   --scrub off (default): train on days [0, cutoff), attack edges left in and unlabeled  -> dirtyts
   --scrub on:            same window with those attack edges removed                    -> cleants
 
 Both score the identical test set (everything at/after the cutoff), so the difference between the
 two runs is attributable to training on unlabeled attack traffic.
+
+Evaluation protocol: gradients come only from the training window, but inference is one
+continuous causal pass over the entire timeline (see rolling_pass). The edges at time t are
+predicted from node embeddings built on the graph at t-1, wherever t-1 falls -- the split
+boundary governs what the model LEARNED from, not what it may look at when scoring.
 
 ArgusTS below overrides Argus.forward to fix three things; see its docstring. The same fixes
 belong in argus_test_lanl.py, which every other Argus number comes from.
@@ -179,88 +182,76 @@ def snapshots(g, mask, is_mal):
 # Scoring
 # ---------------------------------------------------------------------------------------------
 @torch.no_grad()
-def score_window(model, tr, split, args):
+def rolling_pass(model, tr, va, te, args, collect=('va', 'te')):
     '''
-    Decode each snapshot's edges. The GRU is primed on the trailing `--history` training
-    snapshots, then the state is carried from chunk to chunk instead of restarting at each one.
-    '''
-    model.eval()
-    preds, labels = [], []
+    One continuous causal pass over the whole timeline: train hours, then val, then test.
 
-    h = None
-    if args.history:
-        k = args.history
-        _, h = model(tr.x, tr.edge_index[-k:], tr.eas[-k:], tr.idxs[-k:], tr.ptrs[-k:],
-                     h0=None, include_h=True)
+    Every snapshot t is scored with the embedding built from the graph at t-1, wherever t falls
+    -- the split boundaries affect only what the model LEARNED from, never what it sees at
+    inference. The state is never reset and never truncated, so the embedding used for the first
+    test hour is the one that follows from having watched every preceding hour, including the
+    training window's (which is where the dirty/clean difference lives).
 
-    for st in range(0, len(split.edge_index), args.chunk):
-        en = min(st + args.chunk, len(split.edge_index))
-        zs, h = model(tr.x, split.edge_index[st:en], split.eas[st:en],
-                      split.idxs[st:en], split.ptrs[st:en], h0=h, include_h=True)
-        h = h.detach()
+    Snapshot t is scored first and consumed afterwards, so a scored edge is never part of the
+    graph that represents it. Causality relies on the GRU scanning time, i.e. on ArgusTS's fix.
 
-        for j in range(st, en):
-            ei = split.edge_index[j]
-            if ei.size(1) == 0:
-                continue
-            # NOT negated. calc_loss_argus labels RANDOM edges as the positive class and real
-            # edges as the negative one, so Argus is trained to score unlikely edges HIGH:
-            # decode is already an anomaly score. argus_test_lanl.py scores it the same way.
-            preds.append(model.decode(ei.to(model.device), zs[j - st]).cpu())
-            labels.append(split.label[j])
-
-    return torch.cat(preds).float(), torch.cat(labels).long()
-
-
-@torch.no_grad()
-def validate(model, tr, va, args):
-    '''
-    Model-selection signal: real validation edges against random pairs, exactly as
-    Argus.validate does. It uses no malicious labels, which matters here -- the scrubbed
-    validation window has no malicious edges at all, so an anomaly-labelled val metric is
-    undefined for that run and selecting on it would mean selecting on the test set.
+    Returns {split: {'pred': real-edge scores, 'label': ..., 'neg': random-pair scores,
+                     'snapshots': how many were scored}}.
     '''
     model.eval()
-    pos, neg = [], []
+    out = {k: {'pred': [], 'label': [], 'neg': [], 'snapshots': 0} for k in collect}
+    h, z_prev = None, None
 
-    h = None
-    if args.history:
-        k = args.history
-        _, h = model(tr.x, tr.edge_index[-k:], tr.eas[-k:], tr.idxs[-k:], tr.ptrs[-k:],
-                     h0=None, include_h=True)
+    for name, d in (('tr', tr), ('va', va), ('te', te)):
+        n = len(d.edge_index)
+        for st in range(0, n, args.chunk):
+            en = min(st + args.chunk, n)
+            zs, h = model(tr.x, d.edge_index[st:en], d.eas[st:en],
+                          d.idxs[st:en], d.ptrs[st:en], h0=h, include_h=True)
+            h = h.detach()
 
-    for st in range(0, len(va.edge_index), args.chunk):
-        en = min(st + args.chunk, len(va.edge_index))
-        zs, h = model(tr.x, va.edge_index[st:en], va.eas[st:en],
-                      va.idxs[st:en], va.ptrs[st:en], h0=h, include_h=True)
-        h = h.detach()
+            for j in range(st, en):
+                ei = d.edge_index[j]
+                if name in collect and z_prev is not None:
+                    out[name]['snapshots'] += 1
+                    if ei.size(1):
+                        # NOT negated. calc_loss_argus labels RANDOM edges as the positive class
+                        # and real edges as the negative one, so Argus is trained to score
+                        # unlikely edges HIGH: decode is already an anomaly score.
+                        ns = torch.randint(0, z_prev.size(0), ei.size(), device=model.device)
+                        out[name]['pred'].append(model.decode(ei.to(model.device), z_prev).cpu())
+                        out[name]['neg'].append(model.decode(ns, z_prev).cpu())
+                        out[name]['label'].append(d.label[j])
+                # consumed only after snapshot j has been scored; clone so the chunk can be freed
+                z_prev = zs[j - st].clone()
 
-        for j in range(st, en):
-            ei = va.edge_index[j]
-            if ei.size(1) == 0:
-                continue
-            z = zs[j - st]
-            ns = torch.randint(0, z.size(0), ei.size(), device=model.device)
-            pos.append(model.decode(ei.to(model.device), z).cpu())
-            neg.append(model.decode(ns, z).cpu())
+    return out
 
-    pos, neg = torch.cat(pos), torch.cat(neg)
+
+def lp_metrics(part):
+    '''
+    Model-selection signal: real edges against random pairs, as Argus.validate does. It uses no
+    malicious labels, which matters here -- the scrubbed validation window has no malicious edges
+    at all, so an anomaly-labelled val metric is undefined for that run and selecting on it would
+    mean selecting on the test set.
+    '''
+    pos, neg = torch.cat(part['pred']), torch.cat(part['neg'])
     scores = torch.cat([pos, neg]).numpy()
     y = torch.cat([torch.zeros(pos.numel()), torch.ones(neg.numel())]).numpy()  # random = positive
     return roc_auc_score(y, scores), average_precision_score(y, scores)
 
 
-def evaluate(model, tr, split, args):
+def detection_metrics(part):
     '''AUC/AP plus the split-comparable metrics (lift, precision and FP/day at 50% recall).'''
-    preds, labels = score_window(model, tr, split, args)
-    y, p = labels.numpy(), preds.numpy()
+    y = torch.cat(part['label']).long().numpy()
+    p = torch.cat(part['pred']).float().numpy()
     if y.sum() == 0:
         return dict(auc=float('nan'), ap=float('nan'), ap_lift=float('nan'),
                     prec_r50=float('nan'), fp_day_r50=float('nan'))
 
     ap = average_precision_score(y, p)
     prec, fp, _ = threshold_metrics(y, p, recall=0.5)
-    days = len(split.edge_index) / 24  # one snapshot per hour
+    days = part['snapshots'] / 24  # one snapshot per hour
     return dict(auc=roc_auc_score(y, p), ap=ap, ap_lift=ap / prevalence(y),
                 prec_r50=prec, fp_day_r50=fp / days if days else float('nan'))
 
@@ -329,8 +320,9 @@ def train(tr, va, te, args):
             # truncated BPTT: the state crosses the chunk boundary, the gradient does not
             h = h.detach()
 
-        va_auc, va_ap = validate(model, tr, va, args)
-        te_m = evaluate(model, tr, te, args)
+        scored = rolling_pass(model, tr, va, te, args)
+        va_auc, va_ap = lp_metrics(scored['va'])
+        te_m = detection_metrics(scored['te'])
         key = va_auc + va_ap  # the criterion argus_test_lanl.py selects on
 
         marker = ''
@@ -364,16 +356,19 @@ if __name__ == '__main__':
     ap.add_argument('--scrub', action='store_true', help='remove in-window malicious edges (cleants control)')
     ap.add_argument('--device', type=int, default=0)
     ap.add_argument('--runs', type=int, default=5)
-    ap.add_argument('--epochs', type=int, default=50)
-    ap.add_argument('--patience', type=int, default=3)
-    ap.add_argument('--chunk', type=int, default=24, help='snapshots per forward pass')
-    ap.add_argument('--history', type=int, default=24, help='training snapshots used to prime the GRU')
+    ap.add_argument('--epochs', type=int, default=100)
+    ap.add_argument('--patience', type=int, default=10)
+    ap.add_argument('--chunk', type=int, default=24,
+                    help='snapshots per forward pass; 0 = the whole window in one pass, which is '
+                         'what argus_test_lanl.py does (BS = len(tr.edge_index), so one optimizer '
+                         'step per epoch over the full sequence)')
     ap.add_argument('--probe', action='store_true',
                     help='report train-step peak memory at several chunk sizes, then exit')
     ap.add_argument('--cache', default='tmp')
     args = ap.parse_args()
     args.device = args.device if args.device >= 0 else 'cpu'
     tag = 'cleants' if args.scrub else 'dirtyts'
+    tag += f'-{args.days}' if args.days != 7 else ''
 
     os.makedirs(args.cache, exist_ok=True)
     # v2: every split now carries its own neighbour lists, so older caches are not compatible
@@ -386,6 +381,10 @@ if __name__ == '__main__':
         tr, va, te = snapshots(g, tr_m, is_mal), snapshots(g, va_m, is_mal), snapshots(g, te_m, is_mal)
         torch.save((tr, va, te), cache)
         print(f'snapshots: train {len(tr.edge_index)}, val {len(va.edge_index)}, test {len(te.edge_index)} hours')
+
+    if args.chunk <= 0:  # one pass over everything, as in argus_test_lanl.py
+        args.chunk = max(len(tr.edge_index), len(va.edge_index), len(te.edge_index))
+        print(f'--chunk 0: using {args.chunk} (whole window, one optimizer step per epoch)')
 
     torch.set_num_threads(64)
     if args.probe:

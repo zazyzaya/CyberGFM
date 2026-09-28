@@ -181,7 +181,7 @@ class Argus(nn.Module):
 
             zs.append(z)
 
-        zs = torch.stack(zs, dim=1)
+        zs = torch.stack(zs, dim=0)
         out = self.rnn(zs, None)
 
         '''
@@ -190,9 +190,9 @@ class Argus(nn.Module):
             Skipped in UNSW
         '''
         zs = []
-        for t in range(out.size(1)):
-            z = out[:, t, :]
-            z = self.sample_z(z, idxs[i], ptrs[i])
+        for t in range(out.size(0)):
+            z = out[t]
+            z = self.sample_z(z, idxs[t], ptrs[t])
             zs.append(z)
 
         out = torch.stack(zs)

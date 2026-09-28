@@ -1,6 +1,6 @@
 from collections import defaultdict
-import time 
-import json 
+import time
+import json
 
 import pandas as pd
 import torch
@@ -14,7 +14,7 @@ from sklearn.metrics import \
 
 from argus_opt import SOAP
 
-SPEEDTEST = True 
+SPEEDTEST = True
 EPOCHS = 100
 DEVICE = 1
 
@@ -144,18 +144,18 @@ class Argus(nn.Module):
         self.c3 = GCNConv(h_dim, h_dim).to(device)
         nn4 = nn.Sequential(nn.Linear(edge_dim, 8, device=device), nn.ReLU(), # lanl: 3 or 10; optc: 5
                             nn.Linear(8, h_dim * h_dim, device=device))
-        
+
         self.c4 = NNConv(h_dim, h_dim, nn4, aggr='mean').to(device)
         self.rnn = GRU(h_dim, h_dim, z_dim).to(device)
-        
+
         self.decode_mlp = nn.Sequential(
-            nn.Linear(z_dim, z_dim, device=device), 
-            nn.Softmax(dim=1) 
+            nn.Linear(z_dim, z_dim, device=device),
+            nn.Softmax(dim=1)
         )
 
         self.device = device
         self.ap_loss = APLoss(pos_len=pos_samples, margin=0.8, gamma=0.1, surrogate_loss='squared', device=device)
-        self.s = s 
+        self.s = s
 
 
     def forward(self, x, eis, eas, idxs, ptrs):
@@ -179,40 +179,40 @@ class Argus(nn.Module):
 
             zs.append(z)
 
-        zs = torch.stack(zs, dim=1)
+        zs = torch.stack(zs, dim=0)
         out = self.rnn(zs, None)
 
         '''
         Scores are much better when we skip the aggregation step
         AUC 0.05 -> what's reported (at least 0.6, but it's still training)
-            Skipped in UNSW 
+            Skipped in UNSW
         '''
         zs = []
-        for t in range(out.size(1)): 
-            z = out[:, t, :]
-            z = self.sample_z(z, idxs[i], ptrs[i])
+        for t in range(out.size(0)):
+            z = out[t]
+            z = self.sample_z(z, idxs[t], ptrs[t])
             zs.append(z)
 
         out = torch.stack(zs)
 
         # out = out.transpose(1,0) # Uncomment if skipping aggr
-        return out 
+        return out
 
-    def sample_z(self, z, idx,ptr): 
+    def sample_z(self, z, idx,ptr):
         z_agg = []
-        for i in range(z.size(0)): 
+        for i in range(z.size(0)):
             n_neighbors = idx[i+1]-idx[i]
-            
+
             if n_neighbors:
                 neighbors = ptr[idx[i] + torch.ones(n_neighbors).multinomial(self.s, replacement=True)]
                 z_agg.append((z[neighbors].sum(dim=0) + z[i]) / (self.s+1))
-            else: 
+            else:
                 z_agg.append(z[i])
-        
-        z_agg = torch.stack(z_agg) 
+
+        z_agg = torch.stack(z_agg)
         return self.decode_mlp(z_agg)
 
-    def decode(self, ei, z): 
+    def decode(self, ei, z):
         return (z[ei[0]] * z[ei[1]]).sum(dim=1)
 
     def calc_loss_argus(self, zs, eis):
@@ -232,10 +232,10 @@ class Argus(nn.Module):
                 torch.cat((pos_pred, neg_pred), 0),
                 torch.cat((torch.ones(pos_pred.size(0)),torch.zeros(neg_pred.size(0))), 0).to(self.device).detach(),
                 t_index)
-            
+
         return tot_loss.true_divide(len(zs))
 
-    def validate(self, zs, eis): 
+    def validate(self, zs, eis):
         pos, neg = [],[]
         for i in range(len(zs)):
             ps = eis[i]
@@ -248,7 +248,7 @@ class Argus(nn.Module):
 
             pos.append(pos_pred)
             neg.append(neg_pred)
-            
+
         pos = torch.cat(pos)
         neg = torch.cat(neg)
         return pos, neg
@@ -257,8 +257,8 @@ class Argus(nn.Module):
 def to_snapshots(g, ts=None, add_csr=False):
     # Assumes graph has src and col already
     ei = torch.stack([g.src, g.col])
-    
-    # Normalize 
+
+    # Normalize
     g.raw_edge_attr = g.raw_edge_attr / g.raw_edge_attr.max(dim=0).values
 
     eis = []
@@ -276,14 +276,14 @@ def to_snapshots(g, ts=None, add_csr=False):
 
         idx = [0]
         ptr = []
-        
-        if add_csr: 
+
+        if add_csr:
             csr_dict = defaultdict(list)
-            for i in range(ei_t.size(1)): 
+            for i in range(ei_t.size(1)):
                 src,dst = ei_t[:, i]
                 csr_dict[src.item()].append(dst.item())
-            
-            for i in range(g.x.size(0)): 
+
+            for i in range(g.x.size(0)):
                 ptr += csr_dict[i]
                 idx.append(idx[-1] + len(csr_dict[i]))
 
@@ -304,12 +304,12 @@ def train(tr,va,te):
 
     best = (0,0,0)
     best_cheating = (0,0)
-    PATIENCE = 3 # Default for lanl 
+    PATIENCE = 3 # Default for lanl
     BS = 64
     no_progress = 0
     for e in range(EPOCHS):
-        fwd_time=bwd_time=loss_time=step_time = 0 
-        for i in range(len(tr.edge_index) // BS): 
+        fwd_time=bwd_time=loss_time=step_time = 0
+        for i in range(len(tr.edge_index) // BS):
             st_i = i*BS
             en_i = (i+1)*BS
 
@@ -340,7 +340,7 @@ def train(tr,va,te):
 
             print(f'[{e}] Loss: {loss.item():0.4f}')
 
-        if SPEEDTEST: 
+        if SPEEDTEST:
             with open('argus_speedtest.csv', 'a') as f:
                 f.write(f'UNSW,{fwd_time},{loss_time},{bwd_time},{step_time}\n')
             exit()
@@ -350,11 +350,11 @@ def train(tr,va,te):
             zs = model.forward(tr.x, tr.edge_index, tr.eas, tr.idxs, tr.ptrs)
             pos,neg = model.validate(zs[:42], va.edge_index)
             labels = torch.zeros(pos.size(0)+neg.size(0))
-            labels[pos.size(0):] = 1 
-            
+            labels[pos.size(0):] = 1
+
             preds = torch.cat([pos,neg]).numpy()
             labels = labels.numpy()
-            
+
             va_auc = auc_score(labels, preds)
             va_ap = ap_score(labels, preds)
 
@@ -378,20 +378,20 @@ def train(tr,va,te):
             if va_auc+va_ap > best[0]:
                 best = (va_auc+va_ap, auc, ap)
                 print('*')
-                no_progress = 0 
+                no_progress = 0
             else:
                 print()
-                no_progress += 1 
+                no_progress += 1
 
             # Validation doesn't want to work. I want to give Argus a fair
-            # run, so let's just keep track of the best scores without 
-            # using the val set (this is data snooping, but even with 
+            # run, so let's just keep track of the best scores without
+            # using the val set (this is data snooping, but even with
             # snooping, it doesn't seem like it will perform well)
-            if auc > best_cheating[0]: 
+            if auc > best_cheating[0]:
                 best_cheating = (auc, ap)
 
-            if no_progress > PATIENCE: 
-                break 
+            if no_progress > PATIENCE:
+                break
 
             print(json.dumps({'auc': best[1], 'ap': best[2], 'auc_last': auc, 'ap_last': ap, 'auc_snooped': best_cheating[0], 'ap_snooped': best_cheating[1]}, indent=1))
 
@@ -414,5 +414,5 @@ if __name__ == '__main__':
     df = pd.DataFrame(best)
     df.loc['mean'] = df.mean()
     df.loc['sem'] = df.sem()
-    
+
     df.to_csv('argus_results_unsw.csv')

@@ -16,7 +16,7 @@ from sklearn.metrics import \
 from argus_opt import SOAP
 from fast_auc import fast_auc, fast_ap
 
-SPEEDTEST = True 
+SPEEDTEST = True
 EPOCHS = 100
 DEVICE = 0
 
@@ -183,7 +183,7 @@ class Argus(nn.Module):
 
             zs.append(z)
 
-        zs = torch.stack(zs, dim=1)
+        zs = torch.stack(zs, dim=0)
         out = self.rnn(zs, None)
 
         '''
@@ -192,9 +192,9 @@ class Argus(nn.Module):
             Skipped in UNSW
         '''
         zs = []
-        for t in range(out.size(1)):
-            z = out[:, t, :]
-            z = self.sample_z(z, idxs[i], ptrs[i])
+        for t in range(out.size(0)):
+            z = out[t]
+            z = self.sample_z(z, idxs[t], ptrs[t])
             zs.append(z)
 
         out = torch.stack(zs)
@@ -319,8 +319,8 @@ def train(tr,va,te):
     BS = len(tr.edge_index)
     no_progress = 0
     for e in range(EPOCHS):
-        fwd_time=bwd_time=loss_time=step_time = 0 
-        for i in range(len(tr.edge_index) // BS): 
+        fwd_time=bwd_time=loss_time=step_time = 0
+        for i in range(len(tr.edge_index) // BS):
             st_i = i*BS
             en_i = (i+1)*BS
 
@@ -351,11 +351,11 @@ def train(tr,va,te):
 
             print(f'[{e}] Loss: {loss.item():0.4f}')
 
-        if SPEEDTEST: 
+        if SPEEDTEST:
             with open('argus_speedtest.csv', 'a') as f:
                 f.write(f'LANL,{fwd_time},{loss_time},{bwd_time},{step_time}\n')
             exit()
-            
+
 
         with torch.no_grad():
             model.eval()

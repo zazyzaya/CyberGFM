@@ -234,7 +234,7 @@ def make_causal_lp_scorer(model, tr, walk_len, delta, score='sigmoid'):
 def score_split(score_fn, split, tr, bs, desc):
     n = split.col.size(0)
     out = torch.empty(n)
-    for b in tqdm(torch.arange(n).split(bs), desc=desc, leave=False):
+    for b in tqdm(torch.arange(n).split(bs), desc=desc, leave=False, disable=None):
         samp = [s.to(tr.device) for s in split._single_iter(b, shuffled=False)]
         src, dst, ts = samp[:3]
         ef = samp[3] if len(samp) == 4 else None

@@ -1,27 +1,27 @@
 from typing import Union, List, Tuple, Optional
 
-from temporal_walks import temporal_rw
-import torch 
-from torch import nn, Tensor 
+from graph_walks import temporal_rw
+import torch
+from torch import nn, Tensor
 
 
-class CTDNE(nn.Module): 
+class CTDNE(nn.Module):
     '''
     Mostly copied from PyG Node2Vec
-    Kind of pointless, given UNSW has discrete timesteps, so 
+    Kind of pointless, given UNSW has discrete timesteps, so
     '''
     def __init__(
         self,
         embedding_dim: int,
         walk_length: int,
         context_size: int,
-        num_nodes: int, 
-        walks_per_node: int = 1, 
+        num_nodes: int,
+        walks_per_node: int = 1,
         device = 'cpu'
-    ): 
+    ):
         super().__init__()
 
-        self.num_nodes = num_nodes 
+        self.num_nodes = num_nodes
 
         self.EPS = 1e-15
         assert walk_length >= context_size
@@ -42,10 +42,10 @@ class CTDNE(nn.Module):
     @torch.jit.export
     def pos_sample(self, batch: Tensor, g) -> Tensor:
         batch = batch.repeat(self.walks_per_node)
-        
-        if 'ts' in g.keys(): 
+
+        if 'ts' in g.keys():
             rw = temporal_rw(g.rowptr, g.col, g.ts, batch, self.walk_length)
-        else: 
+        else:
             rw,_ = torch.ops.torch_cluster.random_walk(g.rowptr, g.col, batch, self.walk_length, 1,1)
 
         walks = []
@@ -102,24 +102,24 @@ class CTDNE(nn.Module):
         return pos_loss + neg_loss
 
 
-class GRUEncoder(nn.Module): 
+class GRUEncoder(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, device):
         super().__init__()
         self.gru1 = nn.GRU(in_dim, hidden_dim, device=device)
         self.drop = nn.Dropout(0.3)
-        self.gru2 = nn.GRU(hidden_dim, out_dim, device=device) 
+        self.gru2 = nn.GRU(hidden_dim, out_dim, device=device)
 
-    def forward(self, zs): 
+    def forward(self, zs):
         '''
-        input  (ts x N x d)   matrix 
+        input  (ts x N x d)   matrix
         output (ts x N x out) matrix
         '''
         zs = self.gru1(zs)[0]
-        zs = self.drop(zs) 
+        zs = self.drop(zs)
         return self.gru2(zs)[0]
-    
 
-class Autoencoder(nn.Module): 
+
+class Autoencoder(nn.Module):
     def __init__(self, emb_dim, hidden_dim, latent_dim, device='cpu'):
         super().__init__()
 
@@ -127,13 +127,13 @@ class Autoencoder(nn.Module):
         self.dec = GRUEncoder(latent_dim, hidden_dim, emb_dim, device)
         self.loss = nn.MSELoss()
 
-    def forward(self, zs): 
+    def forward(self, zs):
         enc = self.enc(zs)
         zs_hat = self.dec(enc)
         return self.loss(zs, zs_hat)
-    
-        
-class AnomalyDetector(nn.Module): 
+
+
+class AnomalyDetector(nn.Module):
     def __init__(self, latent_dim, num_nodes, s=10, device='cpu'):
         super().__init__()
         self.predictor = nn.Sequential(
@@ -143,21 +143,21 @@ class AnomalyDetector(nn.Module):
 
         self.s = s
         self.loss = nn.CrossEntropyLoss()
-        self.device = device 
+        self.device = device
 
-    def predict(self, z, te_ei, ptr, col): 
+    def predict(self, z, te_ei, ptr, col):
         '''
         Make sure idx and ptr are from the training set
         '''
         n_u = []
-        for i in range(z.size(0)):             
+        for i in range(z.size(0)):
             # Sample u's neighbors (original code uses same sample for every edge)
             neighbors = col[ptr[i]:ptr[i+1]].to(self.device)
-            
+
             # If u has no neighbors, just make sample == z[u]
             if neighbors.size(0) == 0:
                 n_u.append(torch.full((self.s,), i, device=self.device))
-            else:      
+            else:
                 sample_idx = (torch.rand(self.s, device=self.device) * neighbors.size(0)).long()
                 n_u.append(neighbors[sample_idx])
 
@@ -166,16 +166,16 @@ class AnomalyDetector(nn.Module):
         h_u = self.predictor(u_aggr)
 
         return h_u[te_ei[0]], h_u[te_ei[1]]
-    
-    def forward(self, z, edges, idx, col): 
+
+    def forward(self, z, edges, idx, col):
         h_u, _ = self.predict(z, edges, idx, col)
         loss = self.loss(h_u, edges[1].to(self.device))
-        return loss 
-    
-    def get_score(self, z, edges, idx, col): 
+        return loss
+
+    def get_score(self, z, edges, idx, col):
         h_u,h_v = self.predict(z, edges, idx, col)
-        
+
         src_score = h_u[torch.arange(h_u.size(0)), edges[1]]
         dst_score = h_v[torch.arange(h_u.size(0)), edges[0]]
 
-        return ( (1-src_score) + (1-dst_score) ) / 2 
+        return ( (1-src_score) + (1-dst_score) ) / 2

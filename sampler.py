@@ -1,7 +1,7 @@
 import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected, remove_self_loops
-from temporal_walks import temporal_rw
+from graph_walks import temporal_rw, rw as random_walk
 from joblib import Parallel, delayed
 
 from models.gnn_bert import GNNEmbedding
@@ -309,7 +309,7 @@ class RWSampler(TRWSampler):
 
         batch = batch.repeat(n_walks)
 
-        walks,eids = torch.ops.torch_cluster.random_walk(
+        walks,eids = random_walk(
             self.rowptr, self.col, batch.to(self.device),
             wl, 1, 1
         )

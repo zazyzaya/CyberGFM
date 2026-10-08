@@ -175,6 +175,26 @@ def context(tr, src, ts, delta, use_walk):
         rw = rw[:, :-tr.edge_attr.size(1)]
     return rw
 
+def random_edges_harder(tr, n, generator=None):
+    '''
+    Generate random edges, but make it a little harder than a pure uniform
+    distro. Use real source nodes and random dst nodes. Hopefully will
+    improve validation so it doesn't saturate at 0.99 AUC every time.
+    '''
+    d = tr.device
+    pick = torch.randint(0, tr.col.size(0), (n,), generator=generator)
+
+    if 'src' in tr.data.keys():
+        src = tr.data.src[pick.to(tr.data.src.device)]
+    else:
+        src = torch.searchsorted(tr.rowptr, pick.to(tr.rowptr.device), right=True) - 1
+
+    dst = torch.randint(0, tr.num_nodes, (n,), generator=generator)
+
+    pick_ts = pick.to(tr.ts.device)
+    ts = tr.ts[pick_ts].to(d)
+    ef = (tr.edge_attr[pick_ts] + tr.num_nodes).to(d) if tr.edge_features else None
+    return src.to(d), dst.to(d), ts, ef
 
 def random_edges(tr, n, generator=None):
     '''Random node pairs with timestamps and (offset) edge features drawn from real training edges.'''

@@ -21,7 +21,7 @@ from models.raw_feat_bert import FEAT
 from sampler import RWSampler, TRWSampler
 
 try:
-    from temporal_walks import temporal_rw
+    from graph_walks import temporal_rw
 except ImportError:
     temporal_rw = None
 

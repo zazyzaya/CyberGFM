@@ -1,0 +1,2 @@
+- All hyperparams are what is written in the paper
+- Using completely random negative edges

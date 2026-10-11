@@ -25,10 +25,26 @@ WHAT CHANGED FROM THE PREVIOUS VERSION OF THIS FILE, and why each mattered:
 5. The cache check looked for `tmp/optc_tr.pt` while the writes went to `tmp/optc-ts_tr.pt`, so
    the snapshots were rebuilt on every run.
 
-DELIBERATELY NOT CHANGED: the loss polarity. `calc_loss_argus` labels observed edges 0 and random
-pairs 1, so the model learns an anomaly score directly and no negation is needed at test time.
-Argus's released code labels observed edges 1 and then applies `scores = 1 - scores` before
-scoring. The two are equivalent; do not "fix" one without removing the other.
+6. THE LOSS POLARITY, which an earlier version of this file left inverted on the theory that
+   labelling observed edges 0 and skipping the negation at test time was an equivalent
+   reformulation of Argus's labelling-plus-`1 - scores`. IT IS NOT. APLoss is an
+   average-precision surrogate and AP is asymmetric in the two classes, so mirroring the labels
+   does not mirror the objective -- on LANL, running it inverted cost about 50x in AP (~0.002 vs
+   ~0.11). The model now lives in argus.py with the observed edges as the positive class, and
+   this file negates at eval. Symptoms of the old version, for the record: test AUC below 0.5,
+   a "correct" sign that differed from run to run, and test AUC swinging across [0, 1] between
+   epochs while validation sat at 0.98.
+
+TWO SPLITS. `--dataset optc-argus` (default) is Argus's own temporal split; `--dataset optc` is
+the original random edge split. They need different scoring, and `--split` picks it -- auto
+resolves `optc` to random and everything else to temporal, then checks that against the data's
+timestamps before building anything:
+
+  temporal  test edges come after training. Their snapshots get their own time axis and the
+            GRU state is carried across the boundary into them (item 1 above).
+  random    test edges are interleaved with training. Their snapshots go on the training axis
+            and test snapshot i is scored against the training embedding at i -- the original
+            protocol, which was correct for this split all along.
 
 PARALLELISM. One process = one replication (`--runs 1`, the default). Each finished run appends a
 row to a shared CSV under an exclusive advisory lock, so N jobs on N GPUs can write to one file.
@@ -58,21 +74,23 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
-from torch import nn
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, NNConv
-from torch_geometric.utils import add_remaining_self_loops
 from sklearn.metrics import \
     roc_auc_score as auc_score, \
     average_precision_score as ap_score
 
-from argus_opt import SOAP
+# One shared model definition. argus.py's docstring carries the six fixes and the SCORE
+# CONVENTION: decode() is a reconstruction probability where HIGH MEANS NORMAL, so the anomaly
+# score is its negation. This file used to keep its own copy, which had drifted badly -- it was
+# still training with inverted polarity and an unbounded decoder.
+from argus import Argus, SOAP, chunked_forward
 
 
 # ------------------------------------------------------------------------------------------------
 # Parallel-safe result collection
 # ------------------------------------------------------------------------------------------------
-FIELDS = ['run_id', 'seed', 'dataset', 'score_mode', 'h_dim', 'z_dim', 'lr', 's', 'aggregate',
+FIELDS = ['run_id', 'seed', 'dataset', 'split', 'score_mode', 'h_dim', 'z_dim', 'lr', 's', 'aggregate',
+          'margin', 'gamma', 'beta', 'gru_layers', 'neg_sampling', 'neg_filter',
           'epochs_ran', 'best_epoch', 'n_test_edges', 'n_malicious',
           'auc', 'ap', 'auc_last', 'ap_last', 'auc_snooped', 'ap_snooped',
           'host', 'finished', 'minutes']
@@ -178,7 +196,8 @@ def summarize(csv_path):
     if dupes:
         print(f'  WARNING {dupes} duplicate run_id(s) -- two jobs used the same id, so these are '
               f'not {len(df)} independent replications')
-    for col in ('dataset', 'score_mode', 'h_dim', 'z_dim', 'lr', 'aggregate'):
+    for col in ('dataset', 'split', 'score_mode', 'h_dim', 'z_dim', 'lr', 'aggregate',
+                'margin', 'gamma', 'beta', 'gru_layers', 'neg_sampling', 'neg_filter'):
         if col in df and df[col].nunique() > 1:
             print(f'  WARNING mixed {col}: {sorted(df[col].unique().tolist())} -- these rows are '
                   f'not the same experiment and should not be pooled')
@@ -194,179 +213,6 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-
-def squared_loss(margin, t): return (margin - t) ** 2
-def squared_hinge_loss(margin, t): return torch.max(margin - t, torch.zeros_like(t)) ** 2
-def logistic_loss(margin, t): return torch.log(1 + torch.log(-margin * t))
-
-
-def _check_tensor_shape(inputs, shape=(-1, 1)):
-    if len(inputs.shape) != len(shape):
-        inputs = inputs.reshape(shape)
-    return inputs
-
-
-def _get_surrogate_loss(backend='squared_hinge'):
-    return {'squared_hinge': squared_hinge_loss, 'squared': squared_loss,
-            'logistic': logistic_loss}[backend]
-
-
-class APLoss(torch.nn.Module):
-    '''
-    AP loss with a squared-hinge surrogate (Qi et al., NeurIPS 2021), as vendored by Argus.
-    Unchanged.
-    '''
-
-    def __init__(self, pos_len=None, margin=1.0, gamma=0.99, surrogate_loss='squared_hinge',
-                 device=None):
-        super().__init__()
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.u_all = torch.tensor([0.0] * pos_len).reshape(-1, 1).to(self.device)
-        self.u_pos = torch.tensor([0.0] * pos_len).reshape(-1, 1).to(self.device)
-        self.margin = margin
-        self.gamma = gamma
-        self.surrogate_loss = _get_surrogate_loss(surrogate_loss)
-
-    def forward(self, y_pred, y_true, index_p):
-        y_pred = _check_tensor_shape(y_pred, (-1, 1))
-        y_true = _check_tensor_shape(y_true, (-1, 1))
-        index_p = _check_tensor_shape(index_p, (-1,))
-        index_p = index_p[index_p >= 0]
-
-        pos_mask = (y_true == 1).flatten()
-        f_ps = y_pred[pos_mask]
-        mat_data = y_pred.flatten().repeat(len(f_ps), 1)
-
-        sur_loss = self.surrogate_loss(self.margin, (f_ps - mat_data))
-        pos_sur_loss = sur_loss * pos_mask
-
-        self.u_all[index_p] = ((1 - self.gamma) * self.u_all[index_p]
-                               + self.gamma * sur_loss.mean(1, keepdim=True).detach())
-        self.u_pos[index_p] = ((1 - self.gamma) * self.u_pos[index_p]
-                               + self.gamma * pos_sur_loss.mean(1, keepdim=True).detach())
-
-        p = ((self.u_pos[index_p] - self.u_all[index_p] * pos_mask)
-             / (self.u_all[index_p] ** 2))
-        return torch.mean(p * sur_loss)
-
-
-class GRU(nn.Module):
-    def __init__(self, x_dim, h_dim, z_dim, hidden_units=1):
-        super().__init__()
-        self.rnn = nn.GRU(x_dim, h_dim, num_layers=hidden_units)
-        self.drop = nn.Dropout(0.25)
-        self.lin = nn.Linear(h_dim, z_dim)
-        self.z_dim = z_dim
-
-    def forward(self, xs, h0, include_h=False):
-        xs = self.drop(xs)
-        xs, h = self.rnn(xs) if h0 is None else self.rnn(xs, h0)
-        return (self.lin(xs), h) if include_h else self.lin(xs)
-
-
-class Argus(nn.Module):
-    def __init__(self, in_dim, edge_dim, h_dim, z_dim, device, s=5, pos_samples=784665,
-                 aggregate=False):
-        super().__init__()
-
-        self.c1 = GCNConv(in_dim, h_dim, add_self_loops=True).to(device)
-        self.relu = nn.ReLU()
-        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True).to(device)
-        self.drop = nn.Dropout(0.1)
-        self.ac = nn.Tanh()
-        self.c3 = GCNConv(h_dim, h_dim, add_self_loops=True).to(device)
-        nn4 = nn.Sequential(nn.Linear(edge_dim, 8, device=device), nn.ReLU(),
-                            nn.Linear(8, h_dim * h_dim, device=device))
-        self.c4 = NNConv(h_dim, h_dim, nn4, aggr='mean').to(device)
-        self.rnn = GRU(h_dim, h_dim, z_dim).to(device)
-        self.decode_mlp = nn.Sequential(nn.Linear(z_dim, z_dim, device=device), nn.Softmax(dim=1))
-
-        self.device = device
-        self.ap_loss = APLoss(pos_len=pos_samples, margin=0.8, gamma=0.1,
-                              surrogate_loss='squared', device=device)
-        self.s = s
-        self.aggregate = aggregate
-
-    def forward(self, x, eis, eas, idxs, ptrs, h0=None, include_h=False):
-        '''
-        h0/include_h let the GRU state be threaded across calls, which is what makes it possible
-        to embed the test window as a continuation of the training window instead of restarting
-        the recurrence (and instead of scoring test edges against training-time embeddings).
-        '''
-        eis = [ei.to(self.device) for ei in eis]
-        eas = [ea.to(self.device) for ea in eas]
-        zs = []
-
-        for i in range(len(eis)):
-            ei, ea = eis[i], eas[i]
-            ei_self_loops = add_remaining_self_loops(ei)[0]
-
-            z = self.c1(x.to(self.device), ei_self_loops)
-            z = self.c2(z, ei_self_loops)
-            z = self.relu(z)
-            z = self.drop(z)
-            z = self.c3(z, ei_self_loops)
-            z = self.relu(z)
-            z = self.drop(z)
-            z = self.c4(z, ei, ea)
-            z = self.ac(z)
-            zs.append(z)
-
-        # time-major: (T, N, h), so the GRU scans time and not the node axis
-        out, h = self.rnn(torch.stack(zs, dim=0), h0, include_h=True)
-
-        if self.aggregate:
-            out = torch.stack([self.sample_z(out[t], idxs[t], ptrs[t]) for t in range(out.size(0))])
-
-        return (out, h) if include_h else out
-
-    def sample_z(self, z, idx, ptr):
-        z_agg = []
-        for i in range(z.size(0)):
-            n_neighbors = idx[i + 1] - idx[i]
-            if n_neighbors:
-                neighbors = ptr[idx[i] + torch.ones(n_neighbors).multinomial(self.s, replacement=True)]
-                z_agg.append((z[neighbors].sum(dim=0) + z[i]) / (self.s + 1))
-            else:
-                z_agg.append(z[i])
-        return self.decode_mlp(torch.stack(z_agg))
-
-    def decode(self, ei, z):
-        return (z[ei[0]] * z[ei[1]]).sum(dim=1)
-
-    def calc_loss_argus(self, zs, eis):
-        '''
-        Observed edges are the 0 class and random pairs the 1 class, so the decoder output IS an
-        anomaly score and nothing is negated at test time. Argus's released code uses the
-        opposite labelling plus `scores = 1 - scores`; the two are equivalent.
-        '''
-        tot_loss = torch.zeros(1).to(self.device)
-        for i in range(len(zs)):
-            ps = eis[i]
-            if ps.size(1) == 0:
-                continue
-            ns = torch.randint(0, zs.size(1), ps.size())
-            t_index = torch.arange(0, ps.size(1), dtype=torch.int64, device=self.device).detach()
-            neg_pred = self.decode(ps, zs[i])
-            pos_pred = self.decode(ns, zs[i])
-            tot_loss += self.ap_loss(
-                torch.cat((pos_pred, neg_pred), 0),
-                torch.cat((torch.ones(pos_pred.size(0)), torch.zeros(neg_pred.size(0))), 0)
-                    .to(self.device).detach(),
-                t_index)
-        return tot_loss.true_divide(len(zs))
-
-    def validate(self, zs, eis):
-        pos, neg = [], []
-        for i in range(min(len(zs), len(eis))):
-            ps = eis[i]
-            if ps.size(1) == 0:
-                continue
-            ns = torch.randint(0, zs.size(1), ps.size())
-            pos.append(self.decode(ps, zs[i]))
-            neg.append(self.decode(ns, zs[i]))
-        return torch.cat(pos), torch.cat(neg)
 
 
 def to_snapshots(g, ts, add_csr=False):
@@ -412,18 +258,33 @@ def to_snapshots(g, ts, add_csr=False):
                 idxs=idxs, ptrs=ptrs, cnts=cnts)
 
 
-def chunked_forward(model, x, split, chunk, h0=None):
-    '''Embed a split's snapshots in chunks of `chunk`, threading the GRU state. Returns (zs, h).'''
-    zs, h = [], h0
-    n = len(split.edge_index)
-    for st in range(0, n, chunk):
-        en = min(st + chunk, n)
-        out, h = model.forward(x, split.edge_index[st:en], split.eas[st:en],
-                               split.idxs[st:en] if split.idxs else [],
-                               split.ptrs[st:en] if split.ptrs else [],
-                               h0=h, include_h=True)
-        zs.append(out)
-    return torch.cat(zs, dim=0), h
+def check_split(splits, ts_tr, mode):
+    '''
+    Confirm the data has the shape `mode` assumes, and report how much of the test set survives.
+
+    The code that built optc_tgraph_{tr,va,te} is not in the repository, so the split type is
+    checked against the timestamps rather than trusted from the dataset name. Getting it wrong
+    is not a small error: scoring a temporal split on the training axis drops nearly every test
+    edge (the bug this file originally had), and continuing the recurrence into a random split's
+    test snapshots embeds them as if they came AFTER a window they are actually inside.
+    '''
+    tr, te = splits['tr'], splits['te']
+    tr_lo, tr_hi = int(tr.ts.min()), int(tr.ts.max())
+    te_lo, te_hi = int(te.ts.min()), int(te.ts.max())
+    looks = 'temporal' if te_lo >= tr_hi else 'random'
+    on_axis = torch.isin(te.ts, ts_tr)
+    mal = te.label.clamp(0, 1).bool() if 'label' in te.keys() else torch.zeros_like(on_axis)
+    print(f'split check: train ts [{tr_lo}, {tr_hi}], test ts [{te_lo}, {te_hi}] -> looks {looks}; '
+          f'running as {mode}')
+    if looks != mode:
+        raise SystemExit(
+            f'--split {mode} does not match the data, which looks {looks} (test '
+            f'{"starts after" if looks == "temporal" else "overlaps"} training). Pass '
+            f'--split {looks}, or --split {mode} explicitly only if you know why.')
+    if mode == 'random':
+        print(f'  test edges on the training axis: {on_axis.float().mean():.2%} of all, '
+              f'{on_axis[mal].float().mean() if mal.any() else float("nan"):.2%} of malicious '
+              f'(the rest fall in buckets with no training edges and cannot be scored)')
 
 
 def load_splits(args):
@@ -438,13 +299,15 @@ def load_splits(args):
     Writes go to a per-pid temporary and are moved into place with os.replace, which is atomic
     within a filesystem. So even a job killed mid-build leaves no half-written cache.
     '''
-    paths = {n: f'{args.cache}/{args.dataset}_{n}.pt' for n in ('tr', 'va', 'te')}
+    # The split mode is in the cache name: the test snapshots are built on a different axis in
+    # each mode, so a cache from one must never be loaded by the other.
+    paths = {n: f'{args.cache}/{args.dataset}-{args.split}_{n}.pt' for n in ('tr', 'va', 'te')}
 
     def have_all():
         return all(os.path.exists(p) and os.path.getsize(p) > 0 for p in paths.values())
 
     if not have_all():
-        with FileLock(f'{args.cache}/{args.dataset}_snapshots'):
+        with FileLock(f'{args.cache}/{args.dataset}-{args.split}_snapshots'):
             if not have_all():      # re-check: another job may have built it while we waited
                 print('building snapshots', flush=True)
                 splits = {}
@@ -454,10 +317,16 @@ def load_splits(args):
                     splits[name] = g
 
                 ts_tr = splits['tr'].ts.unique()
+                check_split(splits, ts_tr, args.split)
+                # random:   test edges are interleaved with training edges, so they go on the
+                #           TRAINING axis and test snapshot i is scored against zs_tr[i].
+                # temporal: test edges all come after training, so they get their OWN axis and
+                #           the recurrence is continued into them (item 1 in the header).
+                te_axis = ts_tr if args.split == 'random' else splits['te'].ts.unique()
                 built = {
                     'tr': to_snapshots(splits['tr'], ts_tr, add_csr=args.aggregate),
                     'va': to_snapshots(splits['va'], ts_tr),        # holdout of the SAME window
-                    'te': to_snapshots(splits['te'], splits['te'].ts.unique()),   # own axis, item 1
+                    'te': to_snapshots(splits['te'], te_axis),
                 }
                 for name, obj in built.items():
                     tmp = f'{paths[name]}.tmp{os.getpid()}'
@@ -472,7 +341,10 @@ def load_splits(args):
 def train(tr, va, te, args):
     pos_samples = sum(tr.edge_index[i].size(1) for i in range(len(tr.edge_index)))
     model = Argus(tr.x.size(0), tr.eas[0].size(1), args.h_dim, args.z_dim, args.device,
-                  s=args.s, pos_samples=pos_samples, aggregate=args.aggregate)
+                  s=args.s, pos_samples=pos_samples, aggregate=args.aggregate,
+                  margin=args.margin, gamma=args.gamma,
+                  gru_layers=args.gru_layers, beta=args.beta,
+                  neg_sampling=args.neg_sampling, neg_filter=not args.no_neg_filter)
     opt = SOAP(model.parameters(), lr=args.lr, mode='adam', weight_decay=0.0)
 
     best = (0, 0, 0)
@@ -520,18 +392,27 @@ def train(tr, va, te, args):
             # training window, keeping the GRU state at the boundary
             zs_tr, h = chunked_forward(model, tr.x, tr, args.chunk)
 
+            # Validation is a LINK-PREDICTION metric: observed edges vs. random pairs, scored
+            # with the RAW reconstruction probability and observed edges as the positive class.
+            # It is the one metric that is not negated. (This block used to label observed edges
+            # 0, matching the inverted loss that argus.py now fixes.)
             pos, neg = model.validate(zs_tr, va.edge_index)
-            labels = torch.zeros(pos.size(0) + neg.size(0))
-            labels[pos.size(0):] = 1            # observed 0, random 1: matches calc_loss_argus
-            preds = torch.cat([pos, neg]).cpu().numpy()
-            va_auc = auc_score(labels.numpy(), preds)
-            va_ap = ap_score(labels.numpy(), preds)
+            labels = torch.cat([torch.ones(pos.numel()), torch.zeros(neg.numel())]).numpy()
+            preds = torch.cat([pos, neg]).numpy()
+            va_auc = auc_score(labels, preds)
+            va_ap = ap_score(labels, preds)
             print(f'\tVal AUC: {va_auc:0.4f}, AP: {va_ap:0.4f}')
 
             # TEST WINDOW: embed the test snapshots themselves, continuing the recurrence.
             # contemporaneous = Argus's own protocol (an edge is in the graph that embeds it);
             # predictive scores snapshot t against the embedding from t-1.
-            zs_te, _ = chunked_forward(model, te.x, te, args.chunk, h0=h)
+            if args.split == 'random':
+                # Test snapshots share the training axis, so the training-window embeddings ARE
+                # the contemporaneous ones. They are built from training edges only, so no test
+                # edge shapes the embedding that scores it.
+                zs_te = zs_tr
+            else:
+                zs_te, _ = chunked_forward(model, te.x, te, args.chunk, h0=h)
 
             preds, y, cnt = [], [], []
             for i in range(len(te.edge_index)):
@@ -544,7 +425,10 @@ def train(tr, va, te, args):
                 y.append(te.label[i])
                 cnt.append(te.cnts[i])
 
-            preds = torch.sigmoid(torch.cat(preds)).cpu().numpy()
+            # decode() already applies the sigmoid, and HIGH MEANS NORMAL -- so the anomaly
+            # score is the negated probability ("alarms for the ones under tau"). The old code
+            # applied a second sigmoid and did not negate, which is why its AUC came out inverted.
+            preds = (-torch.cat(preds)).cpu().numpy()
             y = torch.cat(y).clamp(0, 1).cpu().numpy()
             cnt = torch.cat(cnt).cpu().numpy()
             n_test, n_mal = len(y), int(y.sum())
@@ -581,29 +465,61 @@ def train(tr, va, te, args):
 
 if __name__ == '__main__':
     ap = ArgumentParser()
+    # runtime
+    ap.add_argument('--device', type=int, default=0, help='CUDA index, or -1 for CPU')
+    ap.add_argument('--runs', type=int, default=1, help='independent training runs to average')
+    ap.add_argument('--epochs', type=int, default=1000, help='their main.py: 100')
+    ap.add_argument('--patience', type=int, default=100, help='their main.py: 3')
+    ap.add_argument('--threads', type=int, default=0, help='torch.set_num_threads; 0 leaves it')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='torch seed. Omit and it is derived from --run-id, so parallel jobs '
+                         'differ and each stays reproducible on its own')
+
+    # optimisation
+    ap.add_argument('--lr', type=float, default=0.01, help='paper and their main.py: 0.01')
+
+    # model -- Table 3 and the "ARGUS Hyper-parameters" paragraph
+    ap.add_argument('--h-dim', type=int, default=32, help='their main.py: -H/--hidden 32')
+    ap.add_argument('--z-dim', type=int, default=16,
+                    help='paper: "The node embedding size is 16"')
+    ap.add_argument('--gru-layers', type=int, default=2,
+                    help='paper: "The RNN model is a two-layer GRU". Their recurrent.GRU leaves '
+                         'hidden_units at 1 and main.py never overrides it, so 2 follows the '
+                         'PAPER and 1 reproduces their CODE')
+    ap.add_argument('--s', type=int, default=5,
+                    help='neighbours sampled in the aggregation step (only used with --aggregate)')
+    ap.add_argument('--margin', type=float, default=0.8,
+                    help='APLoss margin m (paper: 0.8 for every dataset)')
+    ap.add_argument('--beta', type=float, default=0.5,
+                    help='weight on L_DEC in loss = L_ap + beta * L_DEC '
+                         '(paper: 0.5 for OpTC, "based on their data distributions"). Their released code has NO L_DEC term at all, so any '
+                         'nonzero value runs this repo\'s per-edge BCE reading of eq. 12, which '
+                         'is a GUESS; --beta 0 reproduces their code exactly')
+    ap.add_argument('--gamma', type=float, default=0.1,
+                    help='APLoss moving-average factor (paper: 0.1 for OpTC)')
+    ap.add_argument('--aggregate', action='store_true',
+                    help='apply the neighbour aggregation before decoding. Their repo defines it '
+                         '(inner_forward_sm) and never calls it, so it is OFF by default')
+    ap.add_argument('--neg-sampling', choices=['uniform', 'degree'], default='uniform',
+                    help="negative pairs for L_ap and the val LP metric. The paper allows "
+                         "'uniform random or proportional to the node degrees'; their code does "
+                         "uniform only. 'degree' is a DIAGNOSTIC for the degree shortcut, not "
+                         'their method -- see Argus.sample_negatives in argus.py')
+    ap.add_argument('--no-neg-filter', action='store_true',
+                    help='skip rejecting sampled negatives that are real edges. Their '
+                         'fast_negative_sampling rejects them; this restores the unfiltered form')
+
+    ap.add_argument('--split', choices=['auto', 'temporal', 'random'], default='auto',
+                    help="auto: random for `optc`, temporal for anything else. Checked against "
+                         "the data's timestamps before anything is built; a mismatch stops.")
     ap.add_argument('--dataset', default='optc-argus',
                     help="optc-argus is Argus's own split and labelling (default); optc-ts is ours")
-    ap.add_argument('--device', type=int, default=0)
-    ap.add_argument('--runs', type=int, default=1,
-                    help='replications IN THIS PROCESS. Default 1: fan out across GPUs instead, '
-                         'one job per run, and let the shared CSV collect them.')
     ap.add_argument('--run-id', default=os.environ.get('LSB_JOBINDEX') or '0',
                     help='identifies this replication in the shared CSV. Defaults to '
                          'LSB_JOBINDEX, so `bsub -J "argus[1-5]"` needs nothing else. MUST be '
                          'distinct per job or the rows are not independent replications.')
-    ap.add_argument('--seed', type=int, default=None,
-                    help='default: derived from --run-id, so parallel jobs differ and each is '
-                         'reproducible on its own')
-    ap.add_argument('--epochs', type=int, default=5000)
-    ap.add_argument('--patience', type=int, default=100)
     ap.add_argument('--bs', type=int, default=256, help='snapshots per optimizer step')
     ap.add_argument('--chunk', type=int, default=256, help='snapshots per forward pass at eval')
-    ap.add_argument('--lr', type=float, default=0.01, help='Argus: 0.01')
-    ap.add_argument('--h-dim', type=int, default=32, help='Argus: 32 (was 128 here)')
-    ap.add_argument('--z-dim', type=int, default=16, help='Argus: 16 (was 64 here)')
-    ap.add_argument('--s', type=int, default=5)
-    ap.add_argument('--aggregate', action='store_true',
-                    help="restore the neighbour aggregation Argus's code never calls")
     ap.add_argument('--score-mode', choices=['contemporaneous', 'predictive'],
                     default='contemporaneous',
                     help="contemporaneous is Argus's protocol: the scored edge is in the graph "
@@ -627,11 +543,16 @@ if __name__ == '__main__':
                     help='print mean/sem over the rows already on disk and exit')
     args = ap.parse_args()
 
+    if args.split == 'auto':
+        args.split = 'random' if args.dataset == 'optc' else 'temporal'
     results_csv = args.results or f'argus_results_{args.dataset}{args.tag}.csv'
 
     if args.summarize:
         summarize(results_csv)
         raise SystemExit
+
+    if args.threads:
+        torch.set_num_threads(args.threads)
 
     os.makedirs(args.cache, exist_ok=True)
     tr, va, te = load_splits(args)
@@ -645,7 +566,10 @@ if __name__ == '__main__':
         run_id = args.run_id if args.runs == 1 else f'{args.run_id}.{i}'
         # zlib.crc32, not hash(): str hashing is salted per process (PYTHONHASHSEED), so
         # hash(run_id) would hand the same run a different seed on every invocation.
-        seed = args.seed if args.seed is not None else zlib.crc32(run_id.encode()) % 100_000
+        # args.seed + i, not args.seed: with --runs > 1 a single seed would make every
+        # replication in this process identical.
+        seed = (args.seed + i) if args.seed is not None \
+            else zlib.crc32(run_id.encode()) % 100_000
         seed_everything(seed)
         print(f'=== run {run_id} (seed {seed}) on {socket.gethostname()} ===', flush=True)
 
@@ -654,9 +578,13 @@ if __name__ == '__main__':
         if not res:                     # --speedtest
             continue
 
-        res.update(run_id=run_id, seed=seed, dataset=args.dataset, score_mode=args.score_mode,
+        res.update(run_id=run_id, seed=seed, dataset=args.dataset, split=args.split,
+                   score_mode=args.score_mode,
                    h_dim=args.h_dim, z_dim=args.z_dim, lr=args.lr, s=args.s,
-                   aggregate=int(args.aggregate), host=socket.gethostname(),
+                   aggregate=int(args.aggregate), margin=args.margin, gamma=args.gamma,
+                   beta=args.beta, gru_layers=args.gru_layers,
+                   neg_sampling=args.neg_sampling, neg_filter=int(not args.no_neg_filter),
+                   host=socket.gethostname(),
                    finished=datetime.now().isoformat(timespec='seconds'),
                    minutes=round((time.time() - t0) / 60, 1))
 

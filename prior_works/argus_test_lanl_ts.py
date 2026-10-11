@@ -19,8 +19,9 @@ window (at --cutoff 41 there are none by construction, so --scrub is a no-op the
 Both arms score the identical test set, so the difference is attributable to training on
 unlabeled attack traffic.
 
-ArgusTS overrides Argus.forward to fix three bugs; see its docstring. The same fixes belong in
-argus_test_lanl.py, which every other Argus number comes from.
+The model comes from argus.py, which all three Argus scripts now share -- see its docstring for
+the six fixes and, in particular, for the score convention: decode() returns a reconstruction
+probability where HIGH MEANS NORMAL, so detection_metrics negates it.
 
 Run from prior_works/ (needs data/lanl14argus_tgraph_raw_csr.pt for Argus's edge features):
 
@@ -37,212 +38,17 @@ import time
 
 import pandas as pd
 import torch
-from torch import nn
-import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch_geometric.data import Data
-from torch_geometric.nn import NNConv
-from torch_geometric.utils import add_remaining_self_loops
 
-from argus_test_lanl import Argus, GRU  # same layers, APLoss and optimizer
+# One shared model definition; see argus.py for the six fixes and the score convention
+# (decode() is a reconstruction probability -- HIGH MEANS NORMAL, so detection negates).
+from argus import Argus, SOAP
 
 sys.path.insert(0, '..')
 from metrics import prevalence, threshold_metrics  # noqa: E402
 
-try:  # whatever argus_test_lanl.py already imports
-    from argus_test_lanl import SOAP
-except ImportError:
-    from libauc.optimizers import SOAP
-
 HOUR = 60 * 60
-
-
-class ArgusTS(Argus):
-    '''
-    Argus brought in line with the paper (Xu, Shu & Li, S&P 2024), with three bug fixes.
-
-    FIXES to Argus.forward:
-
-    1. The recurrent scan ran over nodes, not time. Argus.forward stacks the per-snapshot
-       embeddings with torch.stack(zs, dim=1) -> (N, T, h), and self.rnn wraps nn.GRU with
-       batch_first left at False, so the GRU reads dim 0 as the sequence: it scans the NODE
-       axis, whose ordering is arbitrary, and treats each snapshot as an independent batch
-       element. Nothing crossed time. Stacking dim=0 -> (T, N, h) makes the scan temporal with
-       each node as a batch element; the aggregation loop below then indexes time on dim 0.
-
-    2. The aggregation used the wrong snapshot's neighbours. The loop read idxs[i]/ptrs[i],
-       where `i` is left over from the embedding loop above and is always len(eis)-1, so every
-       timestep aggregated over the LAST snapshot's neighbour lists. It now uses idxs[t]/ptrs[t].
-
-    3. The hidden state is exposed (h0 in, h out) so a window can be scored in chunks without
-       restarting the GRU at every chunk boundary.
-
-    DEVIATIONS from the paper that are corrected here:
-
-    4. Loss polarity was inverted. calc_loss_argus labelled the RANDOM edges as the positive
-       class and the observed edges as negative, training the model to score unlikely edges
-       HIGH. The paper's L_ap ranks the observed edges of G_t high (eq. 13, P_t = positive
-       edges in G_t) and detects by "set[ting] off alarms for the ones under tau" -- a LOW
-       reconstruction probability is the anomaly signal. Fixed, and detection_metrics negates
-       accordingly.
-
-    5. L_DEC was missing entirely. The paper optimizes loss = L_ap + beta * L_DEC with
-       beta = 0.01 on LANL, where L_DEC = -log p(A_t | A_hat_t), "cross-entropy (CE) to compute
-       the loss of the decoder on the sampled edges" (eq. 12).
-
-    6. Dimensions were 4x the paper's. Table 3 gives 32-wide EW layers, an EF layer mapping
-       32 -> 16, a node embedding size of 16, and a TWO-layer GRU; the code built 128-wide
-       layers, a 64-d embedding and a one-layer GRU.
-
-    sample_z is also vectorized (same distribution, far less memory).
-    '''
-
-    def __init__(self, in_dim, edge_dim, h_dim=32, z_dim=16, device='cpu', s=5,
-                 pos_samples=283573, gru_layers=1, beta=0.0, gamma=0.01,
-                 neg_sampling='uniform', neg_filter=True, aggregate=False):
-        super().__init__(in_dim, edge_dim, h_dim, z_dim, device, s=s, pos_samples=pos_samples)
-        self.beta = beta
-        self.neg_sampling = neg_sampling
-        self.neg_filter = neg_filter
-        self.aggregate = aggregate
-        # Their main.py sets worker_args = [hidden, hidden] and rnn_args = [hidden, hidden, zdim]
-        # with hidden=32, zdim=16, and recurrent.GRU defaults to hidden_units=1. So c4 IS
-        # h_dim -> h_dim and the GRU's output projection does h_dim -> z_dim -- exactly the shape
-        # Argus.__init__ already builds, with a ONE-layer GRU. Only the sizes were wrong. My
-        # earlier reading of Table 3 (EF 32->16, two-layer GRU) was mistaken; nothing to rebuild.
-
-    def decode(self, ei, z):
-        '''
-        sigmoid of the dot product, per Euler_Embed_Unit.decode in their repo:
-
-            return torch.sigmoid((z[src] * z[dst]).sum(dim=1))
-
-        argus_test_lanl.py returns a bare dot product of decode_mlp outputs, where decode_mlp ends
-        in Softmax(dim=1). That is three differences in one line: the sigmoid is missing, a softmax
-        their scoring path never applies is applied, and the scores end up concentrated near
-        1/z_dim instead of spanning (0, 1). The last one matters most -- APLoss's margin of 0.8 is
-        reachable between two sigmoids and essentially unreachable between two softmax dot
-        products, so the surrogate loss was operating in a regime it was never meant for.
-        '''
-        return torch.sigmoid((z[ei[0]] * z[ei[1]]).sum(dim=1))
-
-    def sample_negatives(self, ps, num_nodes):
-        '''
-        Negative pairs for L_ap.
-
-        'uniform' (default) matches the released fast_negative_sampling: uniform node pairs, but
-        with pairs that are actually edges of this snapshot REJECTED and redrawn. Argus's
-        calc_loss_argus skips that filter, so a fraction of its "negatives" are real edges being
-        pushed down. The collision rate is tiny (~1e-5 per snapshot at this graph's density), so
-        this is fidelity rather than a fix.
-
-        'degree' is a DIAGNOSTIC and a deviation from their code, not a replication of it. It
-        resamples each endpoint from the snapshot's own endpoint multiset so negatives carry the
-        positives' degree distribution. Uniform negatives are nearly separable by degree alone --
-        a uniformly drawn pair is two arbitrary nodes, so "does this edge exist" collapses toward
-        "are these nodes active" -- and a model can improve on that objective by becoming a degree
-        prior, which raises LP AUC while destroying anomaly ranking. Use it to test whether that
-        shortcut is what is happening; do not report it as Argus.
-        '''
-        if self.neg_sampling == 'degree':
-            e = ps.size(1)
-            si = torch.randint(0, e, (e,), device=ps.device)
-            di = torch.randint(0, e, (e,), device=ps.device)
-            return torch.stack([ps[0][si], ps[1][di]])
-
-        ns = torch.randint(0, num_nodes, ps.size(), device=self.device)
-        if self.neg_filter:
-            key = lambda e: e[0] + e[1] * num_nodes   # same hash fast_negative_sampling uses
-            pos_key = key(ps)
-            for _ in range(5):                        # their while-loop, bounded
-                bad = torch.isin(key(ns), pos_key)
-                if not bad.any():
-                    break
-                ns[:, bad] = torch.randint(0, num_nodes, (2, int(bad.sum())), device=self.device)
-        return ns
-
-    def calc_loss_argus(self, zs, eis):
-        '''
-        loss = L_ap + beta * L_DEC, with the OBSERVED edges as the positive class.
-
-        Argus.calc_loss_argus had the two blocks swapped (its `neg_pred` held the real edges),
-        so APLoss was maximizing AP for the random pairs. Here the observed edges of G_t are
-        the positives, matching eq. 13, and L_DEC is the decoder cross-entropy over the same
-        sampled edges (eq. 12). decode() dots two softmax outputs, so it is already in [0, 1]
-        and plain BCE applies rather than the with-logits form.
-        '''
-        tot = torch.zeros(1, device=self.device)
-        for i in range(len(zs)):
-            ps = eis[i]
-            if ps.size(1) == 0:
-                continue
-            ps = ps.to(self.device)
-            ns = self.sample_negatives(ps, zs.size(1))
-            pos = self.decode(ps, zs[i])                   # observed edges -> class 1
-            neg = self.decode(ns, zs[i])                   # random pairs   -> class 0
-
-            score = torch.cat([pos, neg])                  # positives first: APLoss indexes them
-            y = torch.cat([torch.ones_like(pos), torch.zeros_like(neg)]).detach()
-            t_index = torch.arange(pos.size(0), dtype=torch.int64, device=self.device).detach()
-
-            l_ap = self.ap_loss(score, y, t_index)
-            l_dec = F.binary_cross_entropy(score.clamp(1e-7, 1 - 1e-7), y)
-            tot = tot + l_ap + self.beta * l_dec
-
-        return tot.true_divide(len(zs))
-
-    def sample_z(self, z, idx, ptr):
-        '''
-        Vectorized equivalent of Argus.sample_z.
-
-        The original loops over all N nodes in Python and appends to a list, so a single
-        timestep builds ~N little autograd subgraphs; a chunk of T snapshots builds T*N of
-        them. That, not the convolutions, is what makes memory climb snapshot by snapshot.
-
-        ones(deg).multinomial(s, replacement=True) draws s neighbours uniformly with
-        replacement, which is exactly randint(0, deg, (s,)) -- so this samples from the same
-        distribution, using O(1) graph nodes per timestep instead of O(N).
-        '''
-        idx, ptr = idx.to(self.device), ptr.to(self.device)
-        if ptr.numel() == 0:                       # snapshot with no edges
-            return self.decode_mlp(z)
-
-        deg = (idx[1:] - idx[:-1])                 # (N,) neighbours per node
-        has = (deg > 0).unsqueeze(1)
-        off = torch.randint(0, 1 << 30, (z.size(0), self.s), device=self.device)
-        off = off % deg.clamp(min=1).unsqueeze(1)
-        nbr = ptr[(idx[:-1].unsqueeze(1) + off).clamp(max=ptr.numel() - 1)]
-
-        agg = (z[nbr].sum(dim=1) + z) / (self.s + 1)
-        return self.decode_mlp(torch.where(has, agg, z))
-
-    def forward(self, x, eis, eas, idxs, ptrs, h0=None, include_h=False):
-        x = x.to(self.device)
-        eis = [ei.to(self.device) for ei in eis]
-        eas = [ea.to(self.device) for ea in eas]
-
-        zs = []
-        for ei, ea in zip(eis, eas):
-            ei_self_loops = add_remaining_self_loops(ei)[0]
-            z = self.c1(x, ei_self_loops)
-            z = self.c2(z, ei_self_loops)
-            z = self.relu(z)
-            z = self.drop(z)
-            z = self.c3(z, ei_self_loops)
-            z = self.relu(z)
-            z = self.drop(z)
-            z = self.c4(z, ei, edge_attr=ea)
-            z = self.ac(z)
-            zs.append(z)
-
-        out, h = self.rnn(torch.stack(zs, dim=0), h0, include_h=True)   # (T, N, z)
-        # Their forward_once returns the encoder output straight from self.ac(x): the neighbour
-        # aggregation (inner_forward_sm, matmul(s, z) then Softmax) is defined in their repo and
-        # NEVER CALLED. argus_test_lanl.py applies it on every timestep -- and its own comment
-        # already noticed that "scores are much better when we skip the aggregation step".
-        if self.aggregate:
-            out = torch.stack([self.sample_z(out[t], idxs[t], ptrs[t]) for t in range(out.size(0))])
-        return (out, h) if include_h else out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -376,7 +182,7 @@ def rolling_pass(model, x, stages, chunk, keep_edges=False, score_mode='contempo
     Every snapshot t is scored with the embedding built from the graph at t-1, wherever t falls
     -- the split boundaries affect only what the model LEARNED from, never what it sees at
     inference. Snapshot t is scored first and consumed afterwards, so a scored edge is never part
-    of the graph that represents it. Causality relies on the GRU scanning time (ArgusTS's fix).
+    of the graph that represents it. Causality relies on the GRU scanning time (argus.py, fix 2).
 
     Returns {split: {'pred': real-edge scores, 'label': ..., 'neg': random-pair scores,
                      'snapshots': how many were scored}}, plus 'src'/'dst' when keep_edges.
@@ -496,10 +302,11 @@ def top_rank_report(part, tr, ks=(100, 500, 1000, 5000)):
 
 
 def build_model(tr, args):
-    '''Argus at the paper's Table 3 dimensions unless overridden.'''
-    return ArgusTS(tr.x.size(0), tr.eas[0].size(1), args.h_dim, args.z_dim, args.device,
+    '''Argus at their main.py's dimensions unless overridden; the class is in argus.py.'''
+    return Argus(tr.x.size(0), tr.eas[0].size(1), args.h_dim, args.z_dim, args.device,
                    s=args.s, pos_samples=sum(e.size(1) for e in tr.edge_index),
                    gru_layers=args.gru_layers, beta=args.beta, aggregate=args.aggregate,
+                   margin=args.margin, gamma=args.gamma,
                    neg_sampling=args.neg_sampling, neg_filter=not args.no_neg_filter)
 
 
@@ -626,6 +433,48 @@ def train(tr, va, te, args):
 
 if __name__ == '__main__':
     ap = ArgumentParser()
+    # runtime
+    ap.add_argument('--device', type=int, default=0, help='CUDA index, or -1 for CPU')
+    ap.add_argument('--runs', type=int, default=5, help='independent training runs to average')
+    ap.add_argument('--epochs', type=int, default=1000, help='their main.py: 100')
+    ap.add_argument('--patience', type=int, default=100, help='their main.py: 3')
+    ap.add_argument('--threads', type=int, default=0, help='torch.set_num_threads; 0 leaves it')
+    ap.add_argument('--seed', type=int, default=None, help='torch seed; omit for unseeded runs')
+
+    # optimisation
+    ap.add_argument('--lr', type=float, default=0.01, help='paper and their main.py: 0.01')
+
+    # model -- Table 3 and the "ARGUS Hyper-parameters" paragraph
+    ap.add_argument('--h-dim', type=int, default=32, help='their main.py: -H/--hidden 32')
+    ap.add_argument('--z-dim', type=int, default=16,
+                    help='paper: "The node embedding size is 16"')
+    ap.add_argument('--gru-layers', type=int, default=2,
+                    help='paper: "The RNN model is a two-layer GRU". Their recurrent.GRU leaves '
+                         'hidden_units at 1 and main.py never overrides it, so 2 follows the '
+                         'PAPER and 1 reproduces their CODE')
+    ap.add_argument('--s', type=int, default=5,
+                    help='neighbours sampled in the aggregation step (only used with --aggregate)')
+    ap.add_argument('--margin', type=float, default=0.8,
+                    help='APLoss margin m (paper: 0.8 for every dataset)')
+    ap.add_argument('--beta', type=float, default=0.01,
+                    help='weight on L_DEC in loss = L_ap + beta * L_DEC '
+                         '(paper: 0.01 for LANL). Their released code has NO L_DEC term at all, so any '
+                         'nonzero value runs this repo\'s per-edge BCE reading of eq. 12, which '
+                         'is a GUESS; --beta 0 reproduces their code exactly')
+    ap.add_argument('--gamma', type=float, default=0.01,
+                    help='APLoss moving-average factor (paper: 0.01 for LANL)')
+    ap.add_argument('--aggregate', action='store_true',
+                    help='apply the neighbour aggregation before decoding. Their repo defines it '
+                         '(inner_forward_sm) and never calls it, so it is OFF by default')
+    ap.add_argument('--neg-sampling', choices=['uniform', 'degree'], default='uniform',
+                    help="negative pairs for L_ap and the val LP metric. The paper allows "
+                         "'uniform random or proportional to the node degrees'; their code does "
+                         "uniform only. 'degree' is a DIAGNOSTIC for the degree shortcut, not "
+                         'their method -- see Argus.sample_negatives in argus.py')
+    ap.add_argument('--no-neg-filter', action='store_true',
+                    help='skip rejecting sampled negatives that are real edges. Their '
+                         'fast_negative_sampling rejects them; this restores the unfiltered form')
+
     ap.add_argument('--csr', default='../data/lanl14argus_tgraph_raw_csr.pt')
     ap.add_argument('--cutoff', type=float, default=41,
                     help='train/test boundary in HOURS. 41 (= FIRST_RED, 147600s) is the paper\'s '
@@ -636,30 +485,10 @@ if __name__ == '__main__':
     ap.add_argument('--split-seed', type=int, default=0,
                     help='seed for the validation holdout; temporal_split.py uses 0')
     # Architecture / loss, defaults from the paper (Table 3 and section 5)
-    ap.add_argument('--h-dim', type=int, default=32, help="EW layer width (paper: 32)")
-    ap.add_argument('--z-dim', type=int, default=16, help='node embedding size (paper: 16)')
-    ap.add_argument('--gru-layers', type=int, default=1,
-                    help='their recurrent.GRU defaults to hidden_units=1')
-    ap.add_argument('--beta', type=float, default=0.0,
-                    help='weight on L_DEC in loss = L_ap + beta * L_DEC. The paper uses 0.01 on '
-                         'LANL, but the per-edge BCE form implemented here is a GUESS at eq. 12 '
-                         'and can only be satisfied by collapsing embeddings onto a shared basis '
-                         'vector, so it defaults OFF. See calc_loss_argus.')
-    ap.add_argument('--lr', type=float, default=0.01, help='paper: 0.01')
     ap.add_argument('--steps-per-epoch', type=int, default=1,
                     help='optimizer steps per epoch; gradients accumulate across chunks within a '
                          'step. 1 reproduces argus_test_lanl.py (BS = the whole window) regardless '
                          'of how small --chunk has to be for memory')
-    ap.add_argument('--neg-sampling', choices=['uniform', 'degree'], default='uniform',
-                    help="negative pairs for L_ap and for the val LP metric. The paper allows "
-                         "'uniform random or proportional to the node degrees'; the released code "
-                         "only does uniform, which lets a degree prior win the objective. 'degree' "
-                         'resamples endpoints from the snapshot, matching the positive degree '
-                         'distribution. See ArgusTS.sample_negatives.')
-    ap.add_argument('--no-neg-filter', action='store_true',
-                    help="skip rejecting sampled negatives that are real edges. The released "
-                         'fast_negative_sampling rejects them; argus_test_lanl.py does not, so this '
-                         'reproduces the latter')
     ap.add_argument('--never-zero-grad', action='store_true',
                     help='never call opt.zero_grad(), so gradients accumulate across epochs. This '
                          'reproduces their classification.py, which omits it entirely. Requires '
@@ -673,16 +502,10 @@ if __name__ == '__main__':
     ap.add_argument('--rank-report', action='store_true',
                     help='on each new best epoch, report precision@k and the endpoint degrees of '
                          'the highest-scored edges (diagnoses high AUC with low AP)')
-    ap.add_argument('--s', type=int, default=5, help='neighbours sampled in the aggregation step')
-    ap.add_argument('--aggregate', action='store_true',
-                    help='apply the neighbour-sampling aggregation before decoding. Their repo '
-                         'defines it (inner_forward_sm) but never calls it, so this is OFF by '
-                         'default; argus_test_lanl.py applies it on every timestep')
     ap.add_argument('--scrub', action='store_true', help='remove in-window malicious edges (cleants control)')
-    ap.add_argument('--device', type=int, default=0)
-    ap.add_argument('--runs', type=int, default=5)
-    ap.add_argument('--epochs', type=int, default=100)
-    ap.add_argument('--patience', type=int, default=10)
+    ap.add_argument('--tag', default='',
+                    help='appended to the output names, after the auto {clean|dirty}ts-{cutoff}h '
+                         'part, so parallel seed jobs do not overwrite one results file')
     ap.add_argument('--chunk', type=int, default=24,
                     help='snapshots per forward pass; 0 = the whole window in one pass, which is '
                          'what argus_test_lanl.py does (BS = len(tr.edge_index), so one optimizer '
@@ -690,14 +513,12 @@ if __name__ == '__main__':
     ap.add_argument('--probe', action='store_true',
                     help='report train-step peak memory at several chunk sizes, then exit')
     ap.add_argument('--cache', default='tmp')
-    ap.add_argument("--tag", default='')
     args = ap.parse_args()
     args.device = args.device if args.device >= 0 else 'cpu'
     assert 0 < args.val_frac < 1, '--val-frac must be in (0, 1)'
     assert not (args.never_zero_grad and args.steps_per_epoch != 1), \
         '--never-zero-grad only reproduces their loop with --steps-per-epoch 1'
-    tag = f'{"clean" if args.scrub else "dirty"}ts-{args.cutoff:g}h'
-    tag += args.tag
+    tag = f'{"clean" if args.scrub else "dirty"}ts-{args.cutoff:g}h{args.tag}'
 
     os.makedirs(args.cache, exist_ok=True)
     # v3: train and val now share hours (random edge holdout), so older caches are incompatible
@@ -723,6 +544,9 @@ if __name__ == '__main__':
 
     results = []
     for r in range(args.runs):
+        if args.seed is not None:
+            torch.manual_seed(args.seed + r)   # --seed was accepted and never used here
+
         print(f'\n===== run {r} ({tag}) =====')
         results.append(train(tr, va, te, args))
         with open(f'argus_lanl14argus-{tag}_log.csv', 'a') as f:

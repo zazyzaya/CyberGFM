@@ -1,0 +1,2 @@
+run_id,seed,dataset,split,score_mode,h_dim,z_dim,lr,s,aggregate,margin,gamma,beta,gru_layers,neg_sampling,neg_filter,epochs_ran,best_epoch,n_test_edges,n_malicious,auc,ap,auc_last,ap_last,auc_snooped,ap_snooped,host,finished,minutes
+3,3,optc-argus,temporal,contemporaneous,32,16,0.01,5,0,0.8,0.1,0.5,2,uniform,1,179,77,108632,1226,0.08038512080309755,0.013600892518623344,0.0118709262987743,0.013004891973216588,0.8537362017786523,0.4880538851116393,node02.hs.cluster,2026-10-10T11:28:30,25.0

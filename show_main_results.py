@@ -228,7 +228,7 @@ def write_csv(path, agg, metrics, expected_n):
     for m in metrics:
         fields += [m, f'{m}_se']
     with open(path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore', delimiter='\t')
         w.writeheader()
         for (exp, ds, wl) in sorted(agg, key=lambda k: (k[1], k[0], k[2])):
             r = agg[(exp, ds, wl)]

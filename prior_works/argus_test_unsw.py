@@ -1,418 +1,326 @@
+'''
+Argus on UNSW-NB15.
+
+The model comes from argus.py, shared with the LANL and OpTC scripts. Read its docstring for the
+six fixes and especially for the SCORE CONVENTION: decode() returns a reconstruction probability
+where HIGH MEANS NORMAL, so the anomaly score is its complement.
+
+UNSW's split is RANDOM, not temporal (preprocess_unsw.py:partition_tgraph -- torch.randperm, an
+80/10/10 edge partition with every malicious edge forced into test). Test edges are therefore
+interleaved in time with training edges, so building all three splits on the training timestamp
+axis is legitimate here and `zs[i]` IS the contemporaneous embedding for test snapshot i. This is
+the same structure as argus_test_lanl.py and deliberately NOT the per-split axis plus GRU
+continuation that argus_test_optc.py needs for its temporal split.
+
+WHAT CHANGED FROM THE PREVIOUS VERSION OF THIS FILE:
+
+0. `SPEEDTEST = True` was a module-level constant and the speedtest block ends in `exit()` after
+   the first batch of the first epoch. As committed, THIS SCRIPT NEVER EVALUATED ANYTHING -- it
+   wrote one timing row and quit. Any argus_results_unsw.csv on disk came from a hand-edited
+   copy, so whatever produced it is not what the repository contains. It is now an opt-in
+   `--speedtest` flag, default off.
+
+1. LOSS POLARITY was inverted: `neg_pred` held the observed edges and `pos_pred` the random
+   pairs, so APLoss maximised AP for random pairs. Now in argus.py, with observed edges as the
+   positive class, and this file negates at eval. On LANL this one fix was worth ~50x in AP.
+
+2. DECODE had no sigmoid, so APLoss's 0.8 margin applied to unbounded dot products -- while the
+   test block separately inlined its own dot product and applied a sigmoid, so training and
+   scoring were on different scales. Both now go through argus.py's decode().
+
+3. THE AGGREGATION RAN ON EVERY SNAPSHOT, unconditionally, directly below a docstring saying
+   "Skipped in UNSW". Their released code defines it and never calls it. Off unless --aggregate.
+   The `# Comment out for UNSW` markers on c2/c3 were likewise never actually commented out; the
+   three-GCN encoder is kept, matching every other Argus script here.
+
+4. DIMENSIONS were 128/64; their main.py uses 32/16. --h-dim/--z-dim, defaulting to 32/16.
+
+5. NEGATIVE SAMPLING had no true-edge rejection. UNSW has only ~50 nodes, so a uniformly drawn
+   pair is a real edge a large fraction of the time -- this matters far more here than on LANL.
+   argus.py rejects and redraws, as their fast_negative_sampling does.
+
+6. `range(len(tr.edge_index) // BS)` truncated the final partial batch. Now `range(0, n, BS)`.
+
+7. VALIDATION SCORED `zs[:42]` -- a hardcoded 42 left over from LANL's 42-hour window, which on
+   UNSW just means "the first 42 snapshots". It now scores the whole validation window.
+
+8. EDGE FEATURES WERE NORMALISED PER SPLIT: each call did
+   `raw_edge_attr / raw_edge_attr.max(dim=0).values` against its OWN maximum, so train, val and
+   test were on three different scales and the test scaling depended on the test data. The
+   training maximum is now computed once and applied to all three.
+
+9. `DEVICE = 1` was hardcoded, which fails outright on any host that exposes one GPU (every job
+   under `bsub -gpu "num=1"`). Now --device.
+
+10. No argparse, no seeding, and 10 replications in one process. Now one run per process by
+    default with --runs to override, and --seed for reproducibility.
+
+GAMMA. The committed code used APLoss gamma=0.1 here and on OpTC, but 0.01 on LANL (the 0.1 line
+survives as a comment in argus_test_lanl.py). That per-dataset difference is preserved rather
+than harmonised: --gamma defaults to 0.1 on this script. It is an explicit flag so the value is
+always in the run's argparse echo.
+
+    python argus_test_unsw.py --device 0 --runs 5
+    python argus_test_unsw.py --device 0 --speedtest
+'''
+from argparse import ArgumentParser
 from collections import defaultdict
+import os
+import sys
 import time
-import json
 
 import pandas as pd
 import torch
-from torch import nn
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, NNConv
-from torch_geometric.utils import add_remaining_self_loops
 from sklearn.metrics import \
     roc_auc_score as auc_score, \
     average_precision_score as ap_score
 
-from argus_opt import SOAP
+# One shared model definition; a fix there lands in every Argus script at once.
+from argus import Argus, SOAP
 
-SPEEDTEST = True
-EPOCHS = 100
-DEVICE = 1
-
-def squared_loss(margin, t): return (margin - t)** 2
-def squared_hinge_loss(margin, t): return torch.max(margin - t, torch.zeros_like(t)) ** 2
-def logistic_loss(margin, t): return torch.log(1+torch.log(-margin*t))
-
-def _check_tensor_shape(inputs, shape=(-1, 1)):
-    input_shape = inputs.shape
-    target_shape = shape
-    if len(input_shape) != len(target_shape):
-        inputs = inputs.reshape(target_shape)
-    return inputs
-
-def _get_surrogate_loss(backend='squared_hinge'):
-    if backend == 'squared_hinge':
-       surr_loss = squared_hinge_loss
-    elif backend == 'squared':
-       surr_loss = squared_loss
-    elif backend == 'logistic':
-       surr_loss = logistic_loss
-    else:
-        raise ValueError('Out of options!')
-    return surr_loss
+sys.path.insert(0, '..')
+from metrics import detection_metrics  # noqa: E402  -- same module the CyberGFM runs use
 
 
-class APLoss(torch.nn.Module):
-    """AP Loss with squared-hinge function: a novel loss function to directly optimize AUPRC.
+def get_args():
+    ap = ArgumentParser(description='Argus on UNSW-NB15 (random edge split). Defaults reproduce '
+                                    'their released code at their published dimensions.')
+    # runtime
+    ap.add_argument('--device', type=int, default=0, help='CUDA index, or -1 for CPU')
+    ap.add_argument('--runs', type=int, default=5, help='independent training runs to average')
+    ap.add_argument('--epochs', type=int, default=1000, help='their main.py: 100')
+    ap.add_argument('--patience', type=int, default=100, help='their main.py: 3')
+    ap.add_argument('--threads', type=int, default=0, help='torch.set_num_threads; 0 leaves it')
+    ap.add_argument('--seed', type=int, default=None, help='torch seed; omit for unseeded runs')
 
-        Args:
-            margin: margin for squred hinge loss, e.g., m in [0, 1]
-            gamma: factors for moving average
+    # optimisation
+    ap.add_argument('--lr', type=float, default=0.01, help='paper and their main.py: 0.01')
 
-        Return:
-            loss value (scalar)
+    # model -- Table 3 and the "ARGUS Hyper-parameters" paragraph
+    ap.add_argument('--h-dim', type=int, default=32, help='their main.py: -H/--hidden 32')
+    ap.add_argument('--z-dim', type=int, default=16,
+                    help='paper: "The node embedding size is 16"')
+    ap.add_argument('--gru-layers', type=int, default=2,
+                    help='paper: "The RNN model is a two-layer GRU". Their recurrent.GRU leaves '
+                         'hidden_units at 1 and main.py never overrides it, so 2 follows the '
+                         'PAPER and 1 reproduces their CODE')
+    ap.add_argument('--s', type=int, default=5,
+                    help='neighbours sampled in the aggregation step (only used with --aggregate)')
+    ap.add_argument('--margin', type=float, default=0.8,
+                    help='APLoss margin m (paper: 0.8 for every dataset)')
+    ap.add_argument('--beta', type=float, default=0.01,
+                    help='weight on L_DEC in loss = L_ap + beta * L_DEC '
+                         '(NOT in the paper -- Argus never evaluated UNSW. 0.01 is the smaller of their two published values, so the guessed term has the least influence). Their released code has NO L_DEC term at all, so any '
+                         'nonzero value runs this repo\'s per-edge BCE reading of eq. 12, which '
+                         'is a GUESS; --beta 0 reproduces their code exactly')
+    ap.add_argument('--gamma', type=float, default=0.1,
+                    help='APLoss moving-average factor (NOT in the paper; 0.1 is what this file hardcoded, matching OpTC)')
+    ap.add_argument('--aggregate', action='store_true',
+                    help='apply the neighbour aggregation before decoding. Their repo defines it '
+                         '(inner_forward_sm) and never calls it, so it is OFF by default')
+    ap.add_argument('--neg-sampling', choices=['uniform', 'degree'], default='uniform',
+                    help="negative pairs for L_ap and the val LP metric. The paper allows "
+                         "'uniform random or proportional to the node degrees'; their code does "
+                         "uniform only. 'degree' is a DIAGNOSTIC for the degree shortcut, not "
+                         'their method -- see Argus.sample_negatives in argus.py')
+    ap.add_argument('--no-neg-filter', action='store_true',
+                    help='skip rejecting sampled negatives that are real edges. Their '
+                         'fast_negative_sampling rejects them; this restores the unfiltered form')
 
-        Reference:
-                Stochastic Optimization of Areas Under Precision-Recall Curves with Provable Convergence},
-                Qi, Qi and Luo, Youzhi and Xu, Zhao and Ji, Shuiwang and Yang, Tianbao,
-                Advances in Neural Information Processing Systems 2021.
-
-        Notes: This version of AP loss reduces redundant computation for the original implementation by Qi Qi.
-        In addition, it fixed a potential memory leaking issue related to 'u_all' and 'u_pos'. This version is contributed by Gang Li.
-    """
-
-    def __init__(self, pos_len=None, margin=1.0, gamma=0.99, surrogate_loss='squared_hinge', device=None):
-        super(APLoss, self).__init__()
-        if not device:
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            # self.device = torch.device('cpu')
-
-        else:
-            self.device = device
-        self.u_all = torch.tensor([0.0]*pos_len).reshape(-1, 1).to(self.device)#.cpu()
-        self.u_pos = torch.tensor([0.0]*pos_len).reshape(-1, 1).to(self.device)#.cpu()
-        self.margin = margin
-        self.gamma = gamma
-        self.surrogate_loss = _get_surrogate_loss(surrogate_loss)
-
-    def forward(self, y_pred, y_true, index_p):
-        CHECKMEORY=False
-        y_pred = _check_tensor_shape(y_pred, (-1, 1))
-        y_true = _check_tensor_shape(y_true, (-1, 1))
-        index_p = _check_tensor_shape(index_p, (-1,))
-        index_p = index_p[index_p>=0] # only need indices from positive samples
-
-        pos_mask = (y_true == 1).flatten()
-        f_ps = y_pred[pos_mask]
-        mat_data = y_pred.flatten().repeat(len(f_ps), 1)
-
-        sur_loss = self.surrogate_loss(self.margin, (f_ps - mat_data))#.detach() # memory leak here
-        if CHECKMEORY: print(torch.cuda.max_memory_allocated())
-
-        pos_sur_loss = sur_loss * pos_mask
-        if CHECKMEORY: print(torch.cuda.max_memory_allocated())
-
-        self.u_all[index_p] = (1 - self.gamma) * self.u_all[index_p] + self.gamma * (sur_loss.mean(1, keepdim=True)).detach() # memory leak here
-        if CHECKMEORY: print(torch.cuda.max_memory_allocated())
-
-        self.u_pos[index_p] = (1 - self.gamma) * self.u_pos[index_p] + self.gamma * (pos_sur_loss.mean(1, keepdim=True)).detach()
-        if CHECKMEORY: print(torch.cuda.max_memory_allocated())
-
-        p = (self.u_pos[index_p] - (self.u_all[index_p]) * pos_mask) / (self.u_all[index_p] ** 2) # size of p: len(f_ps)* len(y_pred)
-        # p.detach_()
-        loss = torch.mean(p * sur_loss)
-        # loss = (p * sur_loss).mean()
-        if CHECKMEORY: print(torch.cuda.max_memory_allocated())
-
-        # del sur_loss, pos_sur_loss, p
-        return loss
-
-class GRU(nn.Module):
-    def __init__(self, x_dim, h_dim, z_dim, hidden_units=1):
-        super(GRU, self).__init__()
-
-        self.rnn = nn.GRU(
-            x_dim, h_dim, num_layers=hidden_units
-        )
-
-        self.drop = nn.Dropout(0.25)
-        self.lin = nn.Linear(h_dim, z_dim)
-
-        self.z_dim = z_dim
-
-    def forward(self, xs, h0, include_h=False):
-        xs = self.drop(xs)
-
-        if isinstance(h0, type(None)):
-            xs, h = self.rnn(xs)
-        else:
-            xs, h = self.rnn(xs, h0)
-
-        if not include_h:
-            return self.lin(xs)
-
-        return self.lin(xs), h
-
-class Argus(nn.Module):
-    def __init__(self, in_dim, edge_dim, h_dim, z_dim, device, s=5, pos_samples=1775035):
-        super().__init__()
-
-        self.c1 = GCNConv(in_dim, h_dim).to(device)
-        self.relu = nn.ReLU()
-        self.c2 = GCNConv(h_dim, h_dim).to(device)
-        self.drop = nn.Dropout(0.1)
-        self.ac = nn.Tanh()
-        self.c3 = GCNConv(h_dim, h_dim).to(device)
-        nn4 = nn.Sequential(nn.Linear(edge_dim, 8, device=device), nn.ReLU(), # lanl: 3 or 10; optc: 5
-                            nn.Linear(8, h_dim * h_dim, device=device))
-
-        self.c4 = NNConv(h_dim, h_dim, nn4, aggr='mean').to(device)
-        self.rnn = GRU(h_dim, h_dim, z_dim).to(device)
-
-        self.decode_mlp = nn.Sequential(
-            nn.Linear(z_dim, z_dim, device=device),
-            nn.Softmax(dim=1)
-        )
-
-        self.device = device
-        self.ap_loss = APLoss(pos_len=pos_samples, margin=0.8, gamma=0.1, surrogate_loss='squared', device=device)
-        self.s = s
+    ap.add_argument('--bs', type=int, default=64, help='snapshots per optimizer step')
+    ap.add_argument('--speedtest', action='store_true',
+                    help='time one batch, append to argus_speedtest.csv, exit. This used to be a '
+                         'module constant set to True, so the script never evaluated.')
+    ap.add_argument('--data', default='../data', help='directory holding unsw_tgraph_*_raw.pt')
+    ap.add_argument('--tag', default='', help='suffix for the results file')
+    return ap.parse_args()
 
 
-    def forward(self, x, eis, eas, idxs, ptrs):
-        eis = [ei.to(self.device) for ei in eis]
-        eas = [ea.to(self.device) for ea in eas]
-        zs = []
+def to_snapshots(g, ts, add_csr=False, feat_max=None):
+    '''
+    Bucket a split's edges by timestamp onto the axis `ts`.
 
-        for i in range(len(eis)):
-            ei = eis[i]; ea = eas[i]
-            ei_self_loops = add_remaining_self_loops(ei)[0]
-
-            z = self.c1(x.to(self.device), ei_self_loops)
-            z = self.c2(z, ei_self_loops) # Comment out for UNSW
-            z = self.relu(z)
-            z = self.drop(z)
-            z = self.c3(z, ei_self_loops) # Comment out for UNSW
-            z = self.relu(z) # Comment out for UNSW
-            z = self.drop(z) # Comment out for UNSW
-            z = self.c4(z, ei, edge_attr=ea)
-            z = self.ac(z)
-
-            zs.append(z)
-
-        zs = torch.stack(zs, dim=0)
-        out = self.rnn(zs, None)
-
-        '''
-        Scores are much better when we skip the aggregation step
-        AUC 0.05 -> what's reported (at least 0.6, but it's still training)
-            Skipped in UNSW
-        '''
-        zs = []
-        for t in range(out.size(0)):
-            z = out[t]
-            z = self.sample_z(z, idxs[t], ptrs[t])
-            zs.append(z)
-
-        out = torch.stack(zs)
-
-        # out = out.transpose(1,0) # Uncomment if skipping aggr
-        return out
-
-    def sample_z(self, z, idx,ptr):
-        z_agg = []
-        for i in range(z.size(0)):
-            n_neighbors = idx[i+1]-idx[i]
-
-            if n_neighbors:
-                neighbors = ptr[idx[i] + torch.ones(n_neighbors).multinomial(self.s, replacement=True)]
-                z_agg.append((z[neighbors].sum(dim=0) + z[i]) / (self.s+1))
-            else:
-                z_agg.append(z[i])
-
-        z_agg = torch.stack(z_agg)
-        return self.decode_mlp(z_agg)
-
-    def decode(self, ei, z):
-        return (z[ei[0]] * z[ei[1]]).sum(dim=1)
-
-    def calc_loss_argus(self, zs, eis):
-        tot_loss = torch.zeros(1).to(self.device)
-        for i in range(len(zs)):
-            ps = eis[i]
-            if ps.size(1) == 0:
-                continue
-
-            ns = torch.randint(0, zs.size(1), ps.size())
-
-            t_index = torch.arange(0, ps.size(1), dtype=torch.int64, device=self.device).detach()
-            neg_pred = self.decode(ps, zs[i])
-            pos_pred = self.decode(ns, zs[i])
-
-            tot_loss += self.ap_loss(
-                torch.cat((pos_pred, neg_pred), 0),
-                torch.cat((torch.ones(pos_pred.size(0)),torch.zeros(neg_pred.size(0))), 0).to(self.device).detach(),
-                t_index)
-
-        return tot_loss.true_divide(len(zs))
-
-    def validate(self, zs, eis):
-        pos, neg = [],[]
-        for i in range(len(zs)):
-            ps = eis[i]
-            if ps.size(1) == 0:
-                continue
-
-            ns = torch.randint(0, zs.size(1), ps.size())
-            pos_pred = self.decode(ps, zs[i])
-            neg_pred = self.decode(ns, zs[i])
-
-            pos.append(pos_pred)
-            neg.append(neg_pred)
-
-        pos = torch.cat(pos)
-        neg = torch.cat(neg)
-        return pos, neg
-
-
-def to_snapshots(g, ts=None, add_csr=False):
-    # Assumes graph has src and col already
+    feat_max is the per-column maximum used to normalise the edge features. It MUST come from the
+    training split for all three calls: normalising each split by its own maximum put them on
+    different scales and made the test features depend on the test data. Returns the maximum it
+    used so the caller can thread the training one through.
+    '''
     ei = torch.stack([g.src, g.col])
+    if feat_max is None:
+        feat_max = g.raw_edge_attr.max(dim=0).values
+    feat_max = feat_max.clone()
+    feat_max[feat_max == 0] = 1.0            # a constant-zero column must not divide by zero
+    ea_all = g.raw_edge_attr / feat_max
 
-    # Normalize
-    g.raw_edge_attr = g.raw_edge_attr / g.raw_edge_attr.max(dim=0).values
-
-    eis = []
-    eas = []
-    idxs = []
-    ptrs = []
-    y = []
+    eis, eas, idxs, ptrs, y = [], [], [], [], []
     for t in ts:
         mask = g.ts == t
         ei_t = ei[:, mask]
-        ea_t = g.raw_edge_attr[mask]
-
         eis.append(ei_t)
-        eas.append(ea_t)
-
-        idx = [0]
-        ptr = []
+        eas.append(ea_all[mask])
 
         if add_csr:
             csr_dict = defaultdict(list)
             for i in range(ei_t.size(1)):
-                src,dst = ei_t[:, i]
+                src, dst = ei_t[:, i]
                 csr_dict[src.item()].append(dst.item())
-
+            idx, ptr = [0], []
             for i in range(g.x.size(0)):
                 ptr += csr_dict[i]
                 idx.append(idx[-1] + len(csr_dict[i]))
-
             idxs.append(torch.tensor(idx))
             ptrs.append(torch.tensor(ptr))
 
         if 'label' in g.keys():
-            label = g.label[mask]
-            y.append(label)
+            y.append(g.label[mask])
 
     x = torch.eye(g.x.size(0))
-    return Data(x=x, edge_index=eis, label=y, eas=eas, idxs=idxs, ptrs=ptrs)
+    out = Data(x=x, edge_index=eis, label=y, eas=eas, idxs=idxs, ptrs=ptrs,
+               snapshot_ts=torch.as_tensor(ts))
+    return out, feat_max
 
-def train(tr,va,te):
-    pos_samples = sum([tr.edge_index[i].size(1) for i in range(len(tr.edge_index))])
-    model = Argus(tr.x.size(0), tr.eas[0].size(1), 128, 64, DEVICE, pos_samples=pos_samples)
-    opt = SOAP(model.parameters(), lr=0.01, mode='adam', weight_decay=0.0)
 
-    best = (0,0,0)
-    best_cheating = (0,0)
-    PATIENCE = 3 # Default for lanl
-    BS = 64
+def build_model(tr, args):
+    return Argus(tr.x.size(0), tr.eas[0].size(1), args.h_dim, args.z_dim, args.device,
+                 s=args.s, pos_samples=sum(e.size(1) for e in tr.edge_index),
+                 margin=args.margin, gamma=args.gamma, aggregate=args.aggregate,
+                 gru_layers=args.gru_layers, beta=args.beta,
+                 neg_sampling=args.neg_sampling, neg_filter=not args.no_neg_filter)
+
+
+def train(tr, va, te, args):
+    model = build_model(tr, args)
+    opt = SOAP(model.parameters(), lr=args.lr, mode='adam', weight_decay=0.0)
+
+    best = (0, 0, 0, {})
+    best_snooped = (0, 0)
     no_progress = 0
-    for e in range(EPOCHS):
-        fwd_time=bwd_time=loss_time=step_time = 0
-        for i in range(len(tr.edge_index) // BS):
-            st_i = i*BS
-            en_i = (i+1)*BS
+    n_snaps = len(tr.edge_index)
+    print(f'{n_snaps} snapshots, {sum(e.size(1) for e in tr.edge_index):,} training edges')
 
+    for e in range(args.epochs):
+        fwd_time = bwd_time = loss_time = step_time = 0
+        # range(0, n, BS): the old range(n // BS) silently dropped the final partial batch
+        for st_i in range(0, n_snaps, args.bs):
+            en_i = min(st_i + args.bs, n_snaps)
             model.train()
             opt.zero_grad()
 
             st = time.time()
-            print("Fwd", end='', flush=True)
-            zs = model.forward(tr.x, tr.edge_index[st_i:en_i], tr.eas[st_i:en_i], tr.idxs[st_i:en_i], tr.ptrs[st_i:en_i])
+            zs = model.forward(tr.x, tr.edge_index[st_i:en_i], tr.eas[st_i:en_i],
+                               tr.idxs[st_i:en_i] if tr.idxs else [],
+                               tr.ptrs[st_i:en_i] if tr.ptrs else [])
             fwd_time += time.time() - st
-            print(f' ({((fwd_time) / 60):0.2f} mins)')
 
             st = time.time()
-            print("Loss", end='', flush=True)
             loss = model.calc_loss_argus(zs, tr.edge_index[st_i:en_i])
             loss_time += time.time() - st
-            print(f' ({((time.time() - st) / 60):0.2f} mins)')
 
             st = time.time()
-            print("Bwd", end='', flush=True)
             loss.backward()
             bwd_time += time.time() - st
 
             st = time.time()
             opt.step()
             step_time += time.time() - st
-            print(f' ({((time.time() - st) / 60):0.2f} mins)')
+            print(f'[{e}: {st_i}-{en_i}/{n_snaps}] Loss: {loss.item():0.4f}', flush=True)
 
-            print(f'[{e}] Loss: {loss.item():0.4f}')
-
-        if SPEEDTEST:
+        if args.speedtest:
             with open('argus_speedtest.csv', 'a') as f:
                 f.write(f'UNSW,{fwd_time},{loss_time},{bwd_time},{step_time}\n')
-            exit()
+            return None
 
         with torch.no_grad():
             model.eval()
             zs = model.forward(tr.x, tr.edge_index, tr.eas, tr.idxs, tr.ptrs)
-            pos,neg = model.validate(zs[:42], va.edge_index)
-            labels = torch.zeros(pos.size(0)+neg.size(0))
-            labels[pos.size(0):] = 1
 
-            preds = torch.cat([pos,neg]).numpy()
-            labels = labels.numpy()
-
-            va_auc = auc_score(labels, preds)
-            va_ap = ap_score(labels, preds)
-
+            # Validation is a LINK-PREDICTION metric: observed edges vs. random pairs, scored on
+            # the RAW reconstruction probability with observed edges as the positive class. It is
+            # the one metric not negated, and it uses no malicious labels.
+            # Scores the whole window -- the old code passed zs[:42], a LANL leftover.
+            pos, neg = model.validate(zs, va.edge_index)
+            labels = torch.cat([torch.ones(pos.numel()), torch.zeros(neg.numel())]).numpy()
+            va_auc = auc_score(labels, torch.cat([pos, neg]).numpy())
+            va_ap = ap_score(labels, torch.cat([pos, neg]).numpy())
             print(f'\tVal AUC: {va_auc:0.4f}, AP: {va_ap:0.4f}')
 
+            # Test edges live inside the training window (random split), so zs[i] is the
+            # contemporaneous embedding. Goes through model.decode so the sigmoid applies; the
+            # old code inlined the dot product here and bypassed it.
             preds = []
             for i in range(len(te.edge_index)):
-                pred = (
-                    zs[i][te.edge_index[i][0]] *
-                    zs[i][te.edge_index[i][1]]
-                ).sum(dim=1)
-                preds.append(pred)
+                if te.edge_index[i].size(1) == 0:
+                    continue
+                preds.append(model.decode(te.edge_index[i].to(args.device), zs[i]).cpu())
 
-            preds = torch.sigmoid(torch.cat(preds)).numpy()
-            y = torch.cat(te.label).clamp(0,1).numpy()
+            # HIGH MEANS NORMAL, so the anomaly score is the complement -- their score_stats does
+            # exactly this (`scores = 1 - scores`) before computing auc/ap.
+            preds = (1 - torch.cat(preds)).numpy()
+            y = torch.cat([l for l, ei in zip(te.label, te.edge_index) if ei.size(1)]) \
+                     .clamp(0, 1).numpy()
 
             auc = auc_score(y, preds)
             ap = ap_score(y, preds)
+            n_per = torch.as_tensor([ei.size(1) for ei in te.edge_index if ei.size(1)])
+            keep = torch.as_tensor([i for i, ei in enumerate(te.edge_index) if ei.size(1)])
+            te_ts = te.snapshot_ts[keep].repeat_interleave(n_per).numpy()
+            extra = detection_metrics(y, preds, ap, ts=te_ts, recall=0.5, prefix='')
             print(f'\tTe AUC: {auc:0.4f}, AP: {ap:0.4f}', end='', flush=True)
 
-            if va_auc+va_ap > best[0]:
-                best = (va_auc+va_ap, auc, ap)
+            if va_auc + va_ap > best[0]:
+                best = (va_auc + va_ap, auc, ap, extra)
                 print('*')
                 no_progress = 0
             else:
                 print()
                 no_progress += 1
 
-            # Validation doesn't want to work. I want to give Argus a fair
-            # run, so let's just keep track of the best scores without
-            # using the val set (this is data snooping, but even with
-            # snooping, it doesn't seem like it will perform well)
-            if auc > best_cheating[0]:
-                best_cheating = (auc, ap)
+            # Tracked without using validation, because validation does not track test here.
+            # Data snooping: an upper bound, reported separately, never as the headline.
+            if auc > best_snooped[0]:
+                best_snooped = (auc, ap)
 
-            if no_progress > PATIENCE:
+            if no_progress > args.patience:
                 break
 
-            print(json.dumps({'auc': best[1], 'ap': best[2], 'auc_last': auc, 'ap_last': ap, 'auc_snooped': best_cheating[0], 'ap_snooped': best_cheating[1]}, indent=1))
+    out = {'auc': best[1], 'ap': best[2], 'auc_last': auc, 'ap_last': ap,
+           'auc_snooped': best_snooped[0], 'ap_snooped': best_snooped[1], **best[3]}
+    print(f'Best: AUC {best[1]:0.4f}, AP {best[2]:0.4f}')
+    return out
 
-    print(f"Best: AUC {best[1]:0.4f}, AP {best[2]:0.4f}")
-    return {'auc': best[1], 'ap': best[2], 'auc_last': auc, 'ap_last': ap, 'auc_snooped': best_cheating[0], 'ap_snooped': best_cheating[1]}
 
 if __name__ == '__main__':
-    tr = torch.load('../data/unsw_tgraph_tr_raw.pt', weights_only=False)
-    va = torch.load('../data/unsw_tgraph_va_raw.pt', weights_only=False)
-    te = torch.load('../data/unsw_tgraph_te_raw.pt', weights_only=False)
+    args = get_args()
+    print(args)
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    args.device = args.device if args.device >= 0 else 'cpu'
 
-    ts = tr.ts.unique()
+    raw = {n: torch.load(f'{args.data}/unsw_tgraph_{n}_raw.pt', weights_only=False)
+           for n in ('tr', 'va', 'te')}
+    if 'label' not in raw['te'].keys():
+        raise SystemExit('the test split has no `label`, so no detection metric is computable. '
+                         'Rebuild it with preprocess_unsw.py:partition_tgraph.')
+    ts = raw['tr'].ts.unique()                       # legitimate here: the split is random
+    tr, feat_max = to_snapshots(raw['tr'], ts, add_csr=True)
+    va, _ = to_snapshots(raw['va'], ts, feat_max=feat_max)   # training scale, not their own
+    te, _ = to_snapshots(raw['te'], ts, feat_max=feat_max)
 
-    tr = to_snapshots(tr, ts, add_csr=True)
-    va = to_snapshots(va, ts)
-    te = to_snapshots(te, ts)
+    results = []
+    for r in range(args.runs):
+        if args.seed is not None:
+            torch.manual_seed(args.seed + r)
+        res = train(tr, va, te, args)
+        if res is None:                              # --speedtest
+            break
+        results.append(res)
 
-    torch.set_num_threads(64)
-    best = [train(tr,va,te) for _ in range(10)]
-    df = pd.DataFrame(best)
-    df.loc['mean'] = df.mean()
-    df.loc['sem'] = df.sem()
-
-    df.to_csv('argus_results_unsw.csv')
+    if results:
+        df = pd.DataFrame(results)
+        df.loc['mean'] = df.mean()
+        df.loc['sem'] = df.sem()
+        out = f'argus_results_unsw{args.tag}.csv'
+        df.to_csv(out)
+        print(f'\nWrote {out} ({len(results)} run(s))')
+        print(df.loc[['mean', 'sem']].to_string())

@@ -5,7 +5,6 @@ import os
 import sys
 import time
 
-import pandas as pd
 import torch
 from torch_geometric.data import Data
 from sklearn.metrics import \
@@ -15,7 +14,7 @@ from sklearn.metrics import \
 
 # The model, APLoss, the GRU wrapper and SOAP all live in argus.py, so every Argus script
 # shares one definition and a fix lands everywhere at once.
-from argus import Argus, SOAP
+from argus import Argus, SOAP, append_result, build_once, run_record
 
 sys.path.insert(0, '..')
 from metrics import detection_metrics  # noqa: E402  -- same module the CyberGFM runs use
@@ -27,9 +26,16 @@ def get_args():
     # runtime
     ap.add_argument('--device', type=int, default=0, help='CUDA index, or -1 for CPU')
     ap.add_argument('--runs', type=int, default=10, help='independent training runs to average')
-    ap.add_argument('--epochs', type=int, default=1000, help='their main.py: 100')
-    ap.add_argument('--patience', type=int, default=100, help='their main.py: 3')
+    ap.add_argument('--epochs', type=int, default=1000,
+                    help='with --patience 100, effectively trains to convergence. Their '
+                         'main.py uses 100 epochs, patience 3')
+    ap.add_argument('--patience', type=int, default=100,
+                    help='epochs without validation improvement before stopping '
+                         '(their main.py: 3)')
     ap.add_argument('--threads', type=int, default=64, help='torch.set_num_threads; 0 leaves it')
+    ap.add_argument('--out-dir', default='../results/argus',
+                    help='results go to <out-dir>/<experiment><tag>.csv, one row per '
+                         'run, shared by every seed of the experiment')
     ap.add_argument('--seed', type=int, default=None, help='torch seed; omit for unseeded runs')
 
     # optimisation
@@ -325,8 +331,9 @@ def train(tr, va, te, args):
         print(f'[{e}] Loss: {loss.item():0.4f}')
 
         if args.speedtest:
-            with open(f'argus_speedtest{args.tag}.csv', 'a') as f:
-                f.write(f'LANL,{fwd_time},{loss_time},{bwd_time},{step_time}\n')
+            append_result(f'{args.out_dir}/speedtest.csv',
+                          dict(experiment=f'{args.dataset}{args.tag}', fwd=fwd_time,
+                               loss=loss_time, bwd=bwd_time, step=step_time))
             exit()
 
 
@@ -410,39 +417,28 @@ def train(tr, va, te, args):
 if __name__ == '__main__':
     args = get_args()
     args.device = args.device if args.device >= 0 else 'cpu'
-
-    os.makedirs(args.cache, exist_ok=True)
     print(args)
 
     # cache key carries everything that changes the partition, so switching --val-frac,
     # --test-frac or --split-seed rebuilds instead of silently reusing the wrong split
     cache = (f'{args.cache}/argus_{args.dataset}_v{args.val_frac:g}_t{args.test_frac:g}'
              f'_s{args.split_seed}{"_agg" if args.aggregate else ""}.pt')
-    if os.path.exists(cache):
-        tr, va, te = torch.load(cache, weights_only=False)
-        print(f'loaded snapshots from {cache}')
-    else:
-        tr, va, te = build_splits(args)
-        torch.save((tr, va, te), cache)
+    (tr, va, te), = build_once([cache], lambda: [build_splits(args)])
 
-
-    torch.set_num_threads(args.threads)
+    if args.threads:
+        torch.set_num_threads(args.threads)
     if args.probe:
         probe_memory(tr, args)
         raise SystemExit
 
-    best = []
+    out = f'{args.out_dir}/{args.dataset}{args.tag}.csv'
     for r in range(args.runs):
-        if args.seed is not None:
-            torch.manual_seed(args.seed + r)   # per replication, so each is reproducible alone
-        print(f'\n===== run {r} =====')
-        best.append(train(tr, va, te, args))
-        with open(f'argus_{args.dataset}{args.tag}_log.csv', 'a') as f:
-            f.write(json.dumps(best[-1]) + '\n')
-
-    df = pd.DataFrame(best)
-    df.loc['mean'] = df.mean()
-    df.loc['sem'] = df.sem()
-
-    print(df)
-    df.to_csv(f'argus_results_{args.dataset}{args.tag}.csv')
+        seed = None if args.seed is None else args.seed + r
+        if seed is not None:
+            torch.manual_seed(seed)
+        print(f'\n===== run {r} (seed {seed}) =====')
+        t0 = time.time()
+        res = train(tr, va, te, args)
+        append_result(out, {**run_record(args, seed, (time.time() - t0) / 60,
+                                         dataset=args.dataset, split='random'), **res})
+        print(f'appended to {out}')

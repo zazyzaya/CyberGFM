@@ -31,19 +31,17 @@ Run from prior_works/ (needs data/lanl14argus_tgraph_raw_csr.pt for Argus's edge
 '''
 from argparse import ArgumentParser
 from collections import defaultdict
-import json
 import os
 import sys
 import time
 
-import pandas as pd
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch_geometric.data import Data
 
 # One shared model definition; see argus.py for the six fixes and the score convention
 # (decode() is a reconstruction probability -- HIGH MEANS NORMAL, so detection negates).
-from argus import Argus, SOAP
+from argus import Argus, SOAP, append_result, build_once, run_record
 
 sys.path.insert(0, '..')
 from metrics import prevalence, threshold_metrics  # noqa: E402
@@ -436,9 +434,16 @@ if __name__ == '__main__':
     # runtime
     ap.add_argument('--device', type=int, default=0, help='CUDA index, or -1 for CPU')
     ap.add_argument('--runs', type=int, default=5, help='independent training runs to average')
-    ap.add_argument('--epochs', type=int, default=1000, help='their main.py: 100')
-    ap.add_argument('--patience', type=int, default=100, help='their main.py: 3')
+    ap.add_argument('--epochs', type=int, default=1000,
+                    help='with --patience 100, effectively trains to convergence. Their '
+                         'main.py uses 100 epochs, patience 3')
+    ap.add_argument('--patience', type=int, default=100,
+                    help='epochs without validation improvement before stopping '
+                         '(their main.py: 3)')
     ap.add_argument('--threads', type=int, default=0, help='torch.set_num_threads; 0 leaves it')
+    ap.add_argument('--out-dir', default='../results/argus',
+                    help='results go to <out-dir>/<experiment><tag>.csv, one row per '
+                         'run, shared by every seed of the experiment')
     ap.add_argument('--seed', type=int, default=None, help='torch seed; omit for unseeded runs')
 
     # optimisation
@@ -504,8 +509,9 @@ if __name__ == '__main__':
                          'the highest-scored edges (diagnoses high AUC with low AP)')
     ap.add_argument('--scrub', action='store_true', help='remove in-window malicious edges (cleants control)')
     ap.add_argument('--tag', default='',
-                    help='appended to the output names, after the auto {clean|dirty}ts-{cutoff}h '
-                         'part, so parallel seed jobs do not overwrite one results file')
+                    help='variant suffix for the results file, after the automatic '
+                         '{clean|dirty}ts-{cutoff}h part, e.g. --tag _b0 alongside --beta 0. '
+                         'Seeds of one experiment share a file; do not tag per seed')
     ap.add_argument('--chunk', type=int, default=24,
                     help='snapshots per forward pass; 0 = the whole window in one pass, which is '
                          'what argus_test_lanl.py does (BS = len(tr.edge_index), so one optimizer '
@@ -518,18 +524,15 @@ if __name__ == '__main__':
     assert 0 < args.val_frac < 1, '--val-frac must be in (0, 1)'
     assert not (args.never_zero_grad and args.steps_per_epoch != 1), \
         '--never-zero-grad only reproduces their loop with --steps-per-epoch 1'
-    tag = f'{"clean" if args.scrub else "dirty"}ts-{args.cutoff:g}h{args.tag}'
+    # The split is named without --tag: the tag only distinguishes runs, and putting it in the
+    # cache name made every tagged job rebuild an identical copy of the same split.
+    split_name = f'lanl14argus-{"clean" if args.scrub else "dirty"}ts-{args.cutoff:g}h'
 
-    os.makedirs(args.cache, exist_ok=True)
     # v3: train and val now share hours (random edge holdout), so older caches are incompatible
-    cache = f'{args.cache}/argus_lanl14argus-{tag}_vf{args.val_frac:g}_v3.pt'
-    if os.path.exists(cache):
-        tr, va, te = torch.load(cache, weights_only=False)
-        print(f'loaded snapshots from {cache}: {len(tr.edge_index)} train/val hours, '
-              f'{len(te.edge_index)} test hours')
-    else:
-        tr, va, te = build_splits(args.csr, args.cutoff, args.val_frac, args.scrub, args.split_seed)
-        torch.save((tr, va, te), cache)
+    cache = f'{args.cache}/argus_{split_name}_vf{args.val_frac:g}_v3.pt'
+    (tr, va, te), = build_once([cache], lambda: [build_splits(
+        args.csr, args.cutoff, args.val_frac, args.scrub, args.split_seed)])
+    print(f'{len(tr.edge_index)} train/val hours, {len(te.edge_index)} test hours')
 
     assert len(va.edge_index) == len(tr.edge_index), 'train and val snapshots must stay aligned'
 
@@ -537,23 +540,22 @@ if __name__ == '__main__':
         args.chunk = max(len(tr.edge_index), len(te.edge_index))
         print(f'--chunk 0: using {args.chunk} (whole window, one optimizer step per epoch)')
 
-    torch.set_num_threads(64)
+    if args.threads:
+        torch.set_num_threads(args.threads)
     if args.probe:
         probe_memory(tr, args)
         raise SystemExit
 
-    results = []
+    out = f'{args.out_dir}/{split_name}{args.tag}.csv'
     for r in range(args.runs):
-        if args.seed is not None:
-            torch.manual_seed(args.seed + r)   # --seed was accepted and never used here
-
-        print(f'\n===== run {r} ({tag}) =====')
-        results.append(train(tr, va, te, args))
-        with open(f'argus_lanl14argus-{tag}_log.csv', 'a') as f:
-            f.write(json.dumps(results[-1]) + '\n')
-
-    df = pd.DataFrame(results)
-    df.loc['mean'] = df.mean()
-    df.loc['sem'] = df.sem()
-    print(df)
-    df.to_csv(f'argus_results_lanl14argus-{tag}.csv')
+        seed = None if args.seed is None else args.seed + r
+        if seed is not None:
+            torch.manual_seed(seed)
+        print(f'\n===== run {r} ({split_name}, seed {seed}) =====')
+        t0 = time.time()
+        res = train(tr, va, te, args)
+        append_result(out, {**run_record(args, seed, (time.time() - t0) / 60,
+                                         dataset=split_name, cutoff=args.cutoff,
+                                         scrub=int(args.scrub), score_mode=args.score_mode),
+                            **res})
+        print(f'appended to {out}')

@@ -89,6 +89,12 @@ Three of those do not match the released code, so each script states which it fo
 UNSW appears in neither, because Argus never evaluated it; argus_test_unsw.py documents what it
 picked and why.
 '''
+import csv
+import fcntl
+import os
+import socket
+from datetime import datetime
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -101,7 +107,8 @@ try:
 except ImportError:                                  # pragma: no cover
     from libauc.optimizers import SOAP
 
-__all__ = ['APLoss', 'GRU', 'Argus', 'ArgusTS', 'SOAP',
+__all__ = ['APLoss', 'GRU', 'Argus', 'ArgusTS', 'SOAP', 'chunked_forward',
+           'append_result', 'build_once', 'run_record',
            'squared_loss', 'squared_hinge_loss', 'logistic_loss']
 
 
@@ -410,3 +417,98 @@ def chunked_forward(model, x, split, chunk, h0=None):
                                h0=h, include_h=True)
         zs.append(out)
     return torch.cat(zs, dim=0), h
+
+
+# -----------------------------------------------------------------------------------------------
+# Output. Every Argus script writes through these two functions and nothing else.
+# -----------------------------------------------------------------------------------------------
+def append_result(path, row):
+    '''
+    Append one run's row to a CSV that every seed of the experiment shares.
+
+    The lock is taken on the CSV ITSELF, not on a sibling .lock file, so there is nothing left
+    over afterwards. It is held only for the read-header-then-write, which is what has to be one
+    operation: two jobs that both saw an empty file would otherwise both write a header. The
+    descriptor is opened for writing, which is what an exclusive flock needs on NFS (the Linux
+    NFS client implements flock with POSIX locks).
+
+    The first row fixes the column order. A later row with a key the header lacks is warned about
+    and that column dropped, rather than silently misaligning every row after it.
+    '''
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'a+', newline='') as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            first = f.readline()
+            fields = next(csv.reader([first])) if first.strip() else list(row)
+            missing = [k for k in row if k not in fields]
+            if missing:
+                print(f'[append_result] {path} has no column(s) {missing}; not recorded. '
+                      f'Write variants to their own file with --tag.', flush=True)
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore', restval='')
+            if not first.strip():
+                w.writeheader()
+            w.writerow(row)                    # 'a+' writes at the end whatever the read offset
+            f.flush()
+            os.fsync(f.fileno())               # visible to a reader on another node
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    return path
+
+
+def build_once(paths, build):
+    '''
+    Load the cached objects at `paths`, building them exactly once across concurrent jobs.
+
+    Five seed jobs start together and all find the cache missing. Without this they all build it
+    and all torch.save to the same paths at once; torch.save is not atomic, so a reader can load
+    a truncated archive. Here one job builds while the rest block on `<first path>.lock`, then
+    re-check and load what it wrote. Writes go to a temporary and are os.replace'd into place, so
+    a job killed mid-build leaves no half-written cache.
+
+    The lock file is unlinked BEFORE it is released, so it never outlives the build. That is safe
+    because the only thing it guards -- "does the cache exist yet" -- goes from false to true and
+    never back: a job still waiting on the unlinked file re-checks after acquiring it, finds the
+    cache, and loads it; a job arriving later sees the cache before it ever looks for the lock.
+    '''
+    def ready():
+        return all(os.path.exists(p) and os.path.getsize(p) > 0 for p in paths)
+
+    if not ready():
+        lock = f'{paths[0]}.lock'
+        os.makedirs(os.path.dirname(os.path.abspath(lock)), exist_ok=True)
+        with open(lock, 'a') as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                if not ready():                # another job may have built it while we waited
+                    objs = build()
+                    for p, obj in zip(paths, objs):
+                        tmp = f'{p}.tmp{os.getpid()}'
+                        torch.save(obj, tmp)
+                        os.replace(tmp, p)
+                    print(f'built {", ".join(paths)}', flush=True)
+                    return list(objs)
+            finally:
+                try:
+                    os.unlink(lock)
+                except FileNotFoundError:
+                    pass
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    return [torch.load(p, weights_only=False) for p in paths]
+
+
+def run_record(args, seed, minutes, **extra):
+    '''
+    The columns every Argus results row starts with: who ran, with what, and how long it took.
+    Hyperparameters go in every row so show_argus_results.py can refuse to pool rows that came
+    from different settings.
+    '''
+    rec = dict(seed=seed if seed is not None else '', **extra,
+               lr=args.lr, h_dim=args.h_dim, z_dim=args.z_dim, gru_layers=args.gru_layers,
+               margin=args.margin, gamma=args.gamma, beta=args.beta, s=args.s,
+               aggregate=int(args.aggregate), neg_sampling=args.neg_sampling,
+               neg_filter=int(not args.no_neg_filter), epochs=args.epochs, patience=args.patience,
+               host=socket.gethostname(), finished=datetime.now().isoformat(timespec='seconds'),
+               minutes=round(minutes, 2))
+    return rec

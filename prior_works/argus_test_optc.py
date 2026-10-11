@@ -46,33 +46,21 @@ timestamps before building anything:
             and test snapshot i is scored against the training embedding at i -- the original
             protocol, which was correct for this split all along.
 
-PARALLELISM. One process = one replication (`--runs 1`, the default). Each finished run appends a
-row to a shared CSV under an exclusive advisory lock, so N jobs on N GPUs can write to one file.
-Build the snapshot cache once before fanning out -- `--prepare` -- or let the first job build it
-while the others block on the same lock.
+OUTPUT. One row per training run, appended to <--out-dir>/<dataset><--tag>.csv, which every seed
+of the experiment shares (see argus.append_result). run_argus.sh submits one job per seed.
 
-    python argus_test_optc.py --prepare                         # build tmp/optc-argus_{tr,va,te}.pt
-    python argus_test_optc.py --device 0 --run-id 1              # one replication, appends one row
-    python argus_test_optc.py --summarize                        # mean/sem over whatever is there
-
-    # five in parallel as an LSF job array; LSB_JOBINDEX becomes --run-id automatically
-    bsub -J "argus[1-5]" -q h100 -gpu "num=1:mode=exclusive_process" -n 4 -W 8:00 \
-         -o logs/lsf/argus_%I.out ./argus_one.sh
+    python argus_test_optc.py --device 0 --seed 1                    # optc-argus, one run
+    python argus_test_optc.py --device 0 --seed 1 --dataset optc     # the random split
+    python show_argus_results.py ../results/argus                    # mean and SE per experiment
 '''
 from argparse import ArgumentParser
 from collections import defaultdict
-import csv
-import fcntl
 import json
 import os
 import random
-import socket
 import time
-import zlib
-from datetime import datetime
 
 import numpy as np
-import pandas as pd
 import torch
 from torch_geometric.data import Data
 from sklearn.metrics import \
@@ -83,128 +71,7 @@ from sklearn.metrics import \
 # CONVENTION: decode() is a reconstruction probability where HIGH MEANS NORMAL, so the anomaly
 # score is its negation. This file used to keep its own copy, which had drifted badly -- it was
 # still training with inverted polarity and an unbounded decoder.
-from argus import Argus, SOAP, chunked_forward
-
-
-# ------------------------------------------------------------------------------------------------
-# Parallel-safe result collection
-# ------------------------------------------------------------------------------------------------
-FIELDS = ['run_id', 'seed', 'dataset', 'split', 'score_mode', 'h_dim', 'z_dim', 'lr', 's', 'aggregate',
-          'margin', 'gamma', 'beta', 'gru_layers', 'neg_sampling', 'neg_filter',
-          'epochs_ran', 'best_epoch', 'n_test_edges', 'n_malicious',
-          'auc', 'ap', 'auc_last', 'ap_last', 'auc_snooped', 'ap_snooped',
-          'host', 'finished', 'minutes']
-
-
-class FileLock:
-    '''
-    Exclusive advisory lock on `<path>.lock`, held for the duration of the `with` block.
-
-    The lock lives in its own file rather than on the CSV itself: the holder can then open,
-    truncate or replace the real file freely while the lock is held, and the lock's existence
-    never depends on the data file existing yet.
-
-    LOCK_NB in a retry loop, not a blocking LOCK_EX, deliberately. If the filesystem's lock
-    manager wedges -- which on a shared cluster is a thing that happens -- a blocking flock never
-    returns and the job sits burning wall time with no output. This raises instead.
-
-    On NFSv4 flock works. On NFSv3 without a running lockd it can silently no-op, in which case
-    two simultaneous appends can interleave. If you cannot confirm the mount, use --per-run-files
-    and skip locking altogether.
-    '''
-
-    def __init__(self, path, timeout=3600):
-        self.lockpath = f'{path}.lock'
-        self.timeout = timeout
-        self.fh = None
-
-    def __enter__(self):
-        os.makedirs(os.path.dirname(os.path.abspath(self.lockpath)), exist_ok=True)
-        self.fh = open(self.lockpath, 'a+')
-        start = time.time()
-        waited = False
-        while True:
-            try:
-                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                if waited:
-                    print(f'[lock] acquired after {time.time() - start:.0f}s', flush=True)
-                return self
-            except OSError:
-                if time.time() - start > self.timeout:
-                    self.fh.close()
-                    raise TimeoutError(
-                        f'could not lock {self.lockpath} after {self.timeout}s. Another run is '
-                        f'holding it, or a stale lock survived a kill -- check with '
-                        f'`fuser {self.lockpath}` and delete the file if nothing holds it.')
-                if not waited:
-                    print(f'[lock] waiting on {self.lockpath} ...', flush=True)
-                    waited = True
-                time.sleep(0.5 + random.random())    # jitter: 5 jobs released together
-
-    def __exit__(self, *exc):
-        fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
-        self.fh.close()
-        return False
-
-
-def append_row(csv_path, row, per_run_files=False):
-    '''Append one run's results. Serialised across processes, header written exactly once.'''
-    if per_run_files:
-        # No lock needed: every process writes a distinct path. summarize() globs them.
-        d = f'{csv_path}.d'
-        os.makedirs(d, exist_ok=True)
-        p = f'{d}/run_{row["run_id"]}.csv'
-        with open(p, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction='ignore')
-            w.writeheader()
-            w.writerow(row)
-        return p
-
-    with FileLock(csv_path):
-        # Inside the lock: whether a header is needed and the write itself have to be one
-        # operation, or two processes that both saw an empty file both write a header.
-        fresh = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
-        with open(csv_path, 'a', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction='ignore')
-            if fresh:
-                w.writeheader()
-            w.writerow(row)
-            f.flush()
-            os.fsync(f.fileno())    # so a reader on another node sees the row, not a stale page
-    return csv_path
-
-
-def summarize(csv_path):
-    '''Mean/sem over every row on disk, whichever layout was used.'''
-    import glob
-    frames = []
-    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
-        frames.append(pd.read_csv(csv_path))
-    frames += [pd.read_csv(p) for p in sorted(glob.glob(f'{csv_path}.d/run_*.csv'))]
-    if not frames:
-        print(f'no results yet at {csv_path}')
-        return
-    df = pd.concat(frames, ignore_index=True)
-    df = df[df['ap'].notna()]
-    if df.empty:
-        print(f'{csv_path}: rows present but no completed runs')
-        return
-
-    metrics = ['auc', 'ap', 'auc_last', 'ap_last', 'auc_snooped', 'ap_snooped']
-    print(f'{csv_path}: {len(df)} completed run(s)')
-    dupes = df['run_id'].duplicated().sum()
-    if dupes:
-        print(f'  WARNING {dupes} duplicate run_id(s) -- two jobs used the same id, so these are '
-              f'not {len(df)} independent replications')
-    for col in ('dataset', 'split', 'score_mode', 'h_dim', 'z_dim', 'lr', 'aggregate',
-                'margin', 'gamma', 'beta', 'gru_layers', 'neg_sampling', 'neg_filter'):
-        if col in df and df[col].nunique() > 1:
-            print(f'  WARNING mixed {col}: {sorted(df[col].unique().tolist())} -- these rows are '
-                  f'not the same experiment and should not be pooled')
-    print()
-    print(df[metrics].agg(['mean', 'sem', 'std', 'min', 'max']).to_string(float_format='%.4f'))
-    if len(df) < 2:
-        print('\n(sem is undefined for a single run)')
+from argus import Argus, SOAP, chunked_forward, append_result, build_once, run_record
 
 
 def seed_everything(seed):
@@ -289,54 +156,30 @@ def check_split(splits, ts_tr, mode):
 
 def load_splits(args):
     '''
-    Snapshot cache, safe to call from several processes at once.
-
-    Without the lock, five jobs launched together all find the cache missing, all spend the same
-    ten minutes bucketing edges, and all write the same three files concurrently -- torch.save is
-    not atomic, so a reader can get a truncated archive and the failure looks like data
-    corruption. One process builds; the rest block, then find the files and load them.
-
-    Writes go to a per-pid temporary and are moved into place with os.replace, which is atomic
-    within a filesystem. So even a job killed mid-build leaves no half-written cache.
+    The three snapshot files, built once however many seed jobs start at the same moment (see
+    argus.build_once). The split mode is in the name: the test snapshots sit on a different time
+    axis in each mode, so a cache built for one must never be loaded by the other.
     '''
-    # The split mode is in the cache name: the test snapshots are built on a different axis in
-    # each mode, so a cache from one must never be loaded by the other.
-    paths = {n: f'{args.cache}/{args.dataset}-{args.split}_{n}.pt' for n in ('tr', 'va', 'te')}
+    paths = [f'{args.cache}/{args.dataset}-{args.split}_{n}.pt' for n in ('tr', 'va', 'te')]
 
-    def have_all():
-        return all(os.path.exists(p) and os.path.getsize(p) > 0 for p in paths.values())
+    def build():
+        splits = {}
+        for name in ('tr', 'va', 'te'):
+            g = torch.load(f'../data/{args.dataset}_tgraph_{name}.pt', weights_only=False)
+            g.ts //= args.ts_div
+            splits[name] = g
+        ts_tr = splits['tr'].ts.unique()
+        check_split(splits, ts_tr, args.split)
+        # random:   test edges are interleaved with training edges, so they go on the TRAINING
+        #           axis and test snapshot i is scored against zs_tr[i].
+        # temporal: test edges all come after training, so they get their OWN axis and the
+        #           recurrence is continued into them (item 1 in the header).
+        te_axis = ts_tr if args.split == 'random' else splits['te'].ts.unique()
+        return [to_snapshots(splits['tr'], ts_tr, add_csr=args.aggregate),
+                to_snapshots(splits['va'], ts_tr),         # holdout of the SAME window
+                to_snapshots(splits['te'], te_axis)]
 
-    if not have_all():
-        with FileLock(f'{args.cache}/{args.dataset}-{args.split}_snapshots'):
-            if not have_all():      # re-check: another job may have built it while we waited
-                print('building snapshots', flush=True)
-                splits = {}
-                for name in ('tr', 'va', 'te'):
-                    g = torch.load(f'../data/{args.dataset}_tgraph_{name}.pt', weights_only=False)
-                    g.ts //= args.ts_div
-                    splits[name] = g
-
-                ts_tr = splits['tr'].ts.unique()
-                check_split(splits, ts_tr, args.split)
-                # random:   test edges are interleaved with training edges, so they go on the
-                #           TRAINING axis and test snapshot i is scored against zs_tr[i].
-                # temporal: test edges all come after training, so they get their OWN axis and
-                #           the recurrence is continued into them (item 1 in the header).
-                te_axis = ts_tr if args.split == 'random' else splits['te'].ts.unique()
-                built = {
-                    'tr': to_snapshots(splits['tr'], ts_tr, add_csr=args.aggregate),
-                    'va': to_snapshots(splits['va'], ts_tr),        # holdout of the SAME window
-                    'te': to_snapshots(splits['te'], te_axis),
-                }
-                for name, obj in built.items():
-                    tmp = f'{paths[name]}.tmp{os.getpid()}'
-                    torch.save(obj, tmp)
-                    os.replace(tmp, paths[name])
-                print(f'wrote {", ".join(paths.values())}', flush=True)
-                return built['tr'], built['va'], built['te']
-
-    return tuple(torch.load(paths[n], weights_only=False) for n in ('tr', 'va', 'te'))
-
+    return tuple(build_once(paths, build))
 
 def train(tr, va, te, args):
     pos_samples = sum(tr.edge_index[i].size(1) for i in range(len(tr.edge_index)))
@@ -383,8 +226,9 @@ def train(tr, va, te, args):
             print(f'[{e}: {st_i}-{en_i}/{n_snaps}] Loss: {loss.item():0.4f}', flush=True)
 
         if args.speedtest:
-            with open('argus_speedtest.csv', 'a') as f:
-                f.write(f'{args.dataset},{fwd_time},{loss_time},{bwd_time},{step_time}\n')
+            append_result(f'{args.out_dir}/speedtest.csv',
+                          dict(experiment=f'{args.dataset}{args.tag}', fwd=fwd_time,
+                               loss=loss_time, bwd=bwd_time, step=step_time))
             return None
 
         with torch.no_grad():
@@ -468,12 +312,17 @@ if __name__ == '__main__':
     # runtime
     ap.add_argument('--device', type=int, default=0, help='CUDA index, or -1 for CPU')
     ap.add_argument('--runs', type=int, default=1, help='independent training runs to average')
-    ap.add_argument('--epochs', type=int, default=1000, help='their main.py: 100')
-    ap.add_argument('--patience', type=int, default=100, help='their main.py: 3')
+    ap.add_argument('--epochs', type=int, default=1000,
+                    help='with --patience 100, effectively trains to convergence. Their '
+                         'main.py uses 100 epochs, patience 3')
+    ap.add_argument('--patience', type=int, default=100,
+                    help='epochs without validation improvement before stopping '
+                         '(their main.py: 3)')
     ap.add_argument('--threads', type=int, default=0, help='torch.set_num_threads; 0 leaves it')
-    ap.add_argument('--seed', type=int, default=None,
-                    help='torch seed. Omit and it is derived from --run-id, so parallel jobs '
-                         'differ and each stays reproducible on its own')
+    ap.add_argument('--out-dir', default='../results/argus',
+                    help='results go to <out-dir>/<experiment><tag>.csv, one row per '
+                         'run, shared by every seed of the experiment')
+    ap.add_argument('--seed', type=int, default=None, help='torch seed; omit for unseeded runs')
 
     # optimisation
     ap.add_argument('--lr', type=float, default=0.01, help='paper and their main.py: 0.01')
@@ -514,10 +363,6 @@ if __name__ == '__main__':
                          "the data's timestamps before anything is built; a mismatch stops.")
     ap.add_argument('--dataset', default='optc-argus',
                     help="optc-argus is Argus's own split and labelling (default); optc-ts is ours")
-    ap.add_argument('--run-id', default=os.environ.get('LSB_JOBINDEX') or '0',
-                    help='identifies this replication in the shared CSV. Defaults to '
-                         'LSB_JOBINDEX, so `bsub -J "argus[1-5]"` needs nothing else. MUST be '
-                         'distinct per job or the rows are not independent replications.')
     ap.add_argument('--bs', type=int, default=256, help='snapshots per optimizer step')
     ap.add_argument('--chunk', type=int, default=256, help='snapshots per forward pass at eval')
     ap.add_argument('--score-mode', choices=['contemporaneous', 'predictive'],
@@ -529,68 +374,36 @@ if __name__ == '__main__':
                          'same data; pick one and use it for both or the baselines differ.')
     ap.add_argument('--speedtest', action='store_true')
     ap.add_argument('--cache', default='tmp')
-    ap.add_argument('--tag', default='')
-    ap.add_argument('--results', default=None,
-                    help='shared CSV every run appends to. '
-                         'Default argus_results_{dataset}{tag}.csv')
-    ap.add_argument('--per-run-files', action='store_true',
-                    help='write <results>.d/run_<id>.csv instead of appending to one file. Use '
-                         'this if the results directory is on NFSv3, where flock can no-op; '
-                         '--summarize reads either layout.')
+    ap.add_argument('--tag', default='',
+                    help='variant suffix for the results file, e.g. --tag _b0 alongside '
+                         '--beta 0. Seeds of one experiment share a file; do not tag per seed')
     ap.add_argument('--prepare', action='store_true',
-                    help='build the snapshot cache and exit. Run this once before fanning out.')
-    ap.add_argument('--summarize', action='store_true',
-                    help='print mean/sem over the rows already on disk and exit')
+                    help='build the snapshot cache and exit')
     args = ap.parse_args()
 
     if args.split == 'auto':
         args.split = 'random' if args.dataset == 'optc' else 'temporal'
-    results_csv = args.results or f'argus_results_{args.dataset}{args.tag}.csv'
-
-    if args.summarize:
-        summarize(results_csv)
-        raise SystemExit
-
     if args.threads:
         torch.set_num_threads(args.threads)
 
-    os.makedirs(args.cache, exist_ok=True)
     tr, va, te = load_splits(args)
-
     if args.prepare:
         print(f'{len(tr.edge_index)} train / {len(va.edge_index)} val / {len(te.edge_index)} test '
-              f'snapshots. Cache ready; fan out now.')
+              f'snapshots. Cache ready.')
         raise SystemExit
 
-    for i in range(args.runs):
-        run_id = args.run_id if args.runs == 1 else f'{args.run_id}.{i}'
-        # zlib.crc32, not hash(): str hashing is salted per process (PYTHONHASHSEED), so
-        # hash(run_id) would hand the same run a different seed on every invocation.
-        # args.seed + i, not args.seed: with --runs > 1 a single seed would make every
-        # replication in this process identical.
-        seed = (args.seed + i) if args.seed is not None \
-            else zlib.crc32(run_id.encode()) % 100_000
-        seed_everything(seed)
-        print(f'=== run {run_id} (seed {seed}) on {socket.gethostname()} ===', flush=True)
-
+    out = f'{args.out_dir}/{args.dataset}{args.tag}.csv'
+    for r in range(args.runs):
+        seed = None if args.seed is None else args.seed + r
+        if seed is not None:
+            seed_everything(seed)
+        print(f'=== run {r} (seed {seed}) ===', flush=True)
         t0 = time.time()
         res = train(tr, va, te, args)
         if not res:                     # --speedtest
             continue
-
-        res.update(run_id=run_id, seed=seed, dataset=args.dataset, split=args.split,
-                   score_mode=args.score_mode,
-                   h_dim=args.h_dim, z_dim=args.z_dim, lr=args.lr, s=args.s,
-                   aggregate=int(args.aggregate), margin=args.margin, gamma=args.gamma,
-                   beta=args.beta, gru_layers=args.gru_layers,
-                   neg_sampling=args.neg_sampling, neg_filter=int(not args.no_neg_filter),
-                   host=socket.gethostname(),
-                   finished=datetime.now().isoformat(timespec='seconds'),
-                   minutes=round((time.time() - t0) / 60, 1))
-
-        # Appended as soon as the run ends, not after all --runs finish, so a job killed partway
-        # through keeps whatever it already completed.
-        where = append_row(results_csv, res, per_run_files=args.per_run_files)
-        print(f'appended run {run_id} to {where}', flush=True)
-
-    summarize(results_csv)
+        append_result(out, {**run_record(args, seed, (time.time() - t0) / 60,
+                                         dataset=args.dataset, split=args.split,
+                                         score_mode=args.score_mode, ts_div=args.ts_div),
+                            **res})
+        print(f'appended to {out}', flush=True)

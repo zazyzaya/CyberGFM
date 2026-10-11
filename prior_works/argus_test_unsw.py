@@ -69,7 +69,6 @@ import os
 import sys
 import time
 
-import pandas as pd
 import torch
 from torch_geometric.data import Data
 from sklearn.metrics import \
@@ -77,7 +76,7 @@ from sklearn.metrics import \
     average_precision_score as ap_score
 
 # One shared model definition; a fix there lands in every Argus script at once.
-from argus import Argus, SOAP
+from argus import Argus, SOAP, append_result, run_record
 
 sys.path.insert(0, '..')
 from metrics import detection_metrics  # noqa: E402  -- same module the CyberGFM runs use
@@ -89,9 +88,16 @@ def get_args():
     # runtime
     ap.add_argument('--device', type=int, default=0, help='CUDA index, or -1 for CPU')
     ap.add_argument('--runs', type=int, default=5, help='independent training runs to average')
-    ap.add_argument('--epochs', type=int, default=1000, help='their main.py: 100')
-    ap.add_argument('--patience', type=int, default=100, help='their main.py: 3')
+    ap.add_argument('--epochs', type=int, default=1000,
+                    help='with --patience 100, effectively trains to convergence. Their '
+                         'main.py uses 100 epochs, patience 3')
+    ap.add_argument('--patience', type=int, default=100,
+                    help='epochs without validation improvement before stopping '
+                         '(their main.py: 3)')
     ap.add_argument('--threads', type=int, default=0, help='torch.set_num_threads; 0 leaves it')
+    ap.add_argument('--out-dir', default='../results/argus',
+                    help='results go to <out-dir>/<experiment><tag>.csv, one row per '
+                         'run, shared by every seed of the experiment')
     ap.add_argument('--seed', type=int, default=None, help='torch seed; omit for unseeded runs')
 
     # optimisation
@@ -133,7 +139,9 @@ def get_args():
                     help='time one batch, append to argus_speedtest.csv, exit. This used to be a '
                          'module constant set to True, so the script never evaluated.')
     ap.add_argument('--data', default='../data', help='directory holding unsw_tgraph_*_raw.pt')
-    ap.add_argument('--tag', default='', help='suffix for the results file')
+    ap.add_argument('--tag', default='',
+                    help='variant suffix for the results file, e.g. --tag _b0 alongside '
+                         '--beta 0. Seeds of one experiment share a file; do not tag per seed')
     return ap.parse_args()
 
 
@@ -227,8 +235,9 @@ def train(tr, va, te, args):
             print(f'[{e}: {st_i}-{en_i}/{n_snaps}] Loss: {loss.item():0.4f}', flush=True)
 
         if args.speedtest:
-            with open('argus_speedtest.csv', 'a') as f:
-                f.write(f'UNSW,{fwd_time},{loss_time},{bwd_time},{step_time}\n')
+            append_result(f'{args.out_dir}/speedtest.csv',
+                          dict(experiment=f'unsw{args.tag}', fwd=fwd_time,
+                               loss=loss_time, bwd=bwd_time, step=step_time))
             return None
 
         with torch.no_grad():
@@ -307,20 +316,16 @@ if __name__ == '__main__':
     va, _ = to_snapshots(raw['va'], ts, feat_max=feat_max)   # training scale, not their own
     te, _ = to_snapshots(raw['te'], ts, feat_max=feat_max)
 
-    results = []
+    out = f'{args.out_dir}/unsw{args.tag}.csv'
     for r in range(args.runs):
-        if args.seed is not None:
-            torch.manual_seed(args.seed + r)
+        seed = None if args.seed is None else args.seed + r
+        if seed is not None:
+            torch.manual_seed(seed)
+        print(f'\n===== run {r} (seed {seed}) =====')
+        t0 = time.time()
         res = train(tr, va, te, args)
         if res is None:                              # --speedtest
             break
-        results.append(res)
-
-    if results:
-        df = pd.DataFrame(results)
-        df.loc['mean'] = df.mean()
-        df.loc['sem'] = df.sem()
-        out = f'argus_results_unsw{args.tag}.csv'
-        df.to_csv(out)
-        print(f'\nWrote {out} ({len(results)} run(s))')
-        print(df.loc[['mean', 'sem']].to_string())
+        append_result(out, {**run_record(args, seed, (time.time() - t0) / 60,
+                                         dataset='unsw', split='random'), **res})
+        print(f'appended to {out}')

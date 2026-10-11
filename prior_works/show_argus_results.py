@@ -1,168 +1,185 @@
 '''
-Pool every Argus results file into one CSV with show_main_results.py --csv's exact columns, so
-the Argus rows drop into the same spreadsheet as the CyberGFM rows.
+Mean and SE of every Argus experiment in one or more results directories.
 
-    experiment,dataset,walk_len,n,n_expected,epoch,te_auc,te_auc_se,te_ap,te_ap_se,
-    te_prec_r50,te_prec_r50_se,te_fp_day_r50,te_fp_day_r50_se
+    python show_argus_results.py                                   # ../results/argus
+    python show_argus_results.py ../results/argus-paper-defaults
+    python show_argus_results.py ../results/argus-a ../results/argus-b      # side by side
+    python show_argus_results.py ../results/argus --csv argus.csv           # for the spreadsheet
 
-The four scripts record `auc`, `ap`, and (all but OpTC) `prec_r50` and `fp_day_r50`; those are
-renamed to the te_* names show_main_results uses. walk_len is blank -- Argus has no walk length,
-and leaving the column present but empty keeps the header identical so the two CSVs concatenate.
+Reads both layouts:
 
-Each (experiment, dataset) pools every replication across every seed job: run_all_argus.sh runs
-one training run per job and gives each its own `_s<seed>` output file, so a cell is as many
-replications as there were seeds. The mean and SE are computed from the raw per-run rows; pandas
-also writes `mean` and `sem` rows into each file and this skips them, so that a file holding
-several runs cannot contribute its own average as if it were another replication.
+  current   <experiment>.csv, one row per seed, written by every seed job of the experiment
+            (lanl14argus.csv, optc-argus.csv, lanl14argus-cleants-172h_b0.csv, ...)
+  older     argus_results_<experiment>_s<seed>.csv, one file per seed job, each holding pandas
+            `mean` and `sem` rows after the runs. Those two rows are skipped -- otherwise a file's
+            own average would be pooled in as if it were another replication.
 
-    python collect_argus_results.py                              # -> argus_main.csv
-    python collect_argus_results.py --csv argus_main.csv --table
-    python collect_argus_results.py --expected 25
+Everything else in the directory is ignored: speedtest.csv, *_log.csv, logs/, lock files.
+
+--csv writes show_main_results.py --csv's exact columns, so the rows paste under the CyberGFM
+ones. `experiment` is the directory name, which keeps two directories apart in one sheet;
+walk_len is present but empty, since Argus has none.
 '''
 from argparse import ArgumentParser
+from collections import OrderedDict
 import csv
 import glob
 import math
 import os
 import re
 
-# show_main_results.py:232 write_csv, exactly
+# show_main_results.py write_csv, exactly
 FIELDS = ['experiment', 'dataset', 'walk_len', 'n', 'n_expected', 'epoch']
-METRICS = ['te_auc', 'te_ap', 'te_prec_r50', 'te_fp_day_r50']   # show_main_results.DEFAULT_SHOW
+METRICS = ['te_auc', 'te_ap', 'te_prec_r50', 'te_fp_day_r50']
 for _m in METRICS:
     FIELDS += [_m, f'{_m}_se']
+# what the Argus scripts record -> show_main_results names
+RENAME = {'auc': 'te_auc', 'ap': 'te_ap', 'prec_r50': 'te_prec_r50', 'fp_day_r50': 'te_fp_day_r50'}
 
-# what the Argus scripts call them -> what show_main_results calls them
-RENAME = {'auc': 'te_auc', 'ap': 'te_ap',
-          'prec_r50': 'te_prec_r50', 'fp_day_r50': 'te_fp_day_r50'}
+# Pooling rows that differ in any of these would average two different experiments together.
+HYPER = ['lr', 'h_dim', 'z_dim', 'gru_layers', 'margin', 'gamma', 'beta', 's', 'aggregate',
+         'neg_sampling', 'neg_filter', 'epochs', 'patience', 'split', 'score_mode', 'ts_div',
+         'cutoff', 'scrub']
 
-# results filename -> (experiment, dataset). The _s<seed> suffix run_all_argus.sh adds is stripped
-# first, so all of a cell's seed jobs land in one group.
-PATTERNS = [
-    (re.compile(r'^argus_results_lanl14argus-(dirty|clean)ts-(?P<h>[\d.]+)h$'),
-     lambda m: ('argus', f'lanl14argus-{m.group(1)}ts-{m.group("h")}h')),
-    (re.compile(r'^argus_results_(?P<ds>.+)$'), lambda m: ('argus', m.group('ds'))),
-]
+IGNORE = re.compile(r'(^speedtest|^argus_speedtest|_log$|^argus_main$)')
 
 
-def mean_se(xs):
-    '''Mean and standard error over replications; SE is undefined for n < 2.'''
-    xs = [x for x in xs if x == x]                      # drop NaN
-    n = len(xs)
-    if n == 0:
-        return None, None, 0
-    mu = sum(xs) / n
-    if n < 2:
-        return mu, None, n
-    var = sum((x - mu) ** 2 for x in xs) / (n - 1)
-    return mu, math.sqrt(var) / math.sqrt(n), n
+def experiment_name(stem):
+    '''lanl14argus.csv -> lanl14argus;  argus_results_optc-argus_s3.csv -> optc-argus.'''
+    stem = re.sub(r'^argus_results_', '', stem)
+    return re.sub(r'_s\d+$', '', stem)
 
 
-def read_runs(path):
-    '''
-    Per-run rows from one results file, as dicts of floats.
-
-    Skips the `mean` and `sem` rows pandas appends (their index column is not a number), and
-    OpTC's non-numeric bookkeeping columns.
-    '''
+def read_rows(path):
+    '''Per-run rows as dicts, numbers parsed where possible; pandas mean/sem rows skipped.'''
     rows = []
     with open(path, newline='') as f:
         for row in csv.DictReader(f):
-            idx = next(iter(row.values()))              # the pandas index, or OpTC's run_id
-            first = next(iter(row))
-            if first in ('', 'Unnamed: 0') and not str(idx).strip().lstrip('-').isdigit():
-                continue                                # the mean / sem rows
+            index_col = next(iter(row), None)
+            if index_col in ('', 'Unnamed: 0'):
+                if not str(row[index_col]).strip().isdigit():
+                    continue                            # the `mean` / `sem` rows
+                row.pop(index_col)
             out = {}
             for k, v in row.items():
-                if k in (None, '', 'Unnamed: 0'):
+                if k is None:
                     continue
                 try:
                     out[k] = float(v)
                 except (TypeError, ValueError):
-                    continue                            # host, finished, dataset, ...
-            if out:
+                    out[k] = v
+            if isinstance(out.get('ap'), float):
                 rows.append(out)
     return rows
 
 
-def classify(stem):
-    stem = re.sub(r'_s\d+$', '', stem)                  # the per-seed-job suffix
-    for pat, fn in PATTERNS:
-        m = pat.match(stem)
-        if m:
-            return fn(m)
-    return None
+def mean_se(xs):
+    xs = [x for x in xs if isinstance(x, float) and x == x]
+    n = len(xs)
+    if not n:
+        return None, None
+    mu = sum(xs) / n
+    if n < 2:
+        return mu, None
+    return mu, math.sqrt(sum((x - mu) ** 2 for x in xs) / (n - 1) / n)
+
+
+def load_dir(d):
+    '''experiment -> (rows, files) for one directory.'''
+    groups = OrderedDict()
+    for path in sorted(glob.glob(os.path.join(d, '*.csv'))):
+        stem = os.path.basename(path)[:-4]
+        if IGNORE.search(stem):
+            continue
+        rows = read_rows(path)
+        if not rows:
+            continue
+        g = groups.setdefault(experiment_name(stem), ([], []))
+        g[0].extend(rows)
+        g[1].append(os.path.basename(path))
+    return groups
+
+
+def summarize(d, name, rows, files, expected):
+    rec = {'experiment': os.path.basename(os.path.normpath(d)), 'dataset': name, 'walk_len': '',
+           'n': len(rows), 'n_expected': expected}
+    ep = mean_se([r.get('epoch') for r in rows])[0]
+    rec['epoch'] = '' if ep is None else f'{ep:.4f}'
+    for src, dst in RENAME.items():
+        mu, se = mean_se([r.get(src) for r in rows])
+        rec[dst] = '' if mu is None else f'{mu:.4f}'
+        rec[f'{dst}_se'] = '' if se is None else f'{se:.4f}'
+    mins = mean_se([r.get('minutes') for r in rows])[0]
+    rec['_minutes'] = mins
+
+    warnings = []
+    seeds = [r.get('seed') for r in rows if r.get('seed') not in (None, '')]
+    if len(seeds) != len(set(seeds)):
+        warnings.append('duplicate seeds -- the same replication is counted more than once')
+    for h in HYPER:
+        vals = {r[h] for r in rows if h in r and r[h] != ''}
+        if len(vals) > 1:
+            warnings.append(f'mixed {h}: {sorted(map(str, vals))} -- these rows are different '
+                            f'experiments and should not be pooled')
+    rec['_warnings'] = warnings
+    return rec
 
 
 def main():
-    ap = ArgumentParser()
-    ap.add_argument('--glob', default='argus_results_*.csv',
-                    help='results files to pool (default: every argus_results_*.csv here)')
-    ap.add_argument('--csv', default='argus_main.csv', help='output path')
+    ap = ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap.add_argument('dirs', nargs='*', default=['../results/argus'],
+                    help='results directories to read (default ../results/argus)')
+    ap.add_argument('--csv', help="also write show_main_results.py's --csv format to this path")
     ap.add_argument('--expected', type=int, default=5,
-                    help='n_expected column: one run per seed job, so this is the seed count '
-                         '(default 5)')
-    ap.add_argument('--table', action='store_true', help='also print it readably')
+                    help='expected replications per experiment, for the n_expected column')
     args = ap.parse_args()
 
-    groups, files = {}, {}
-    for path in sorted(glob.glob(args.glob)):
-        stem = os.path.basename(path)[:-4]
-        key = classify(stem)
-        if key is None:
-            print(f'  ? skipping {path} (name does not parse)')
+    out = []
+    for d in args.dirs:
+        if not os.path.isdir(d):
+            raise SystemExit(f'{d}: no such directory')
+        groups = load_dir(d)
+        if not groups:
+            print(f'{d}: no Argus results found')
             continue
-        runs = read_runs(path)
-        if not runs:
-            print(f'  ! {path} has no completed runs')
-            continue
-        groups.setdefault(key, []).extend(runs)
-        files.setdefault(key, []).append(os.path.basename(path))
+        for name, (rows, files) in sorted(groups.items()):
+            out.append(summarize(d, name, rows, files, args.expected))
 
-    if not groups:
-        raise SystemExit(f'nothing matched {args.glob} in {os.getcwd()}')
+    if not out:
+        raise SystemExit(1)
 
-    out_rows = []
-    for key in sorted(groups, key=lambda k: (k[1], k[0])):
-        exp, ds = key
-        runs = groups[key]
-        row = {'experiment': exp, 'dataset': ds, 'walk_len': '',
-               'n': len(runs), 'n_expected': args.expected}
+    multi = len(args.dirs) > 1
+    w = max(len(r['dataset']) for r in out)
+    hdr = (f'{"directory":24s} ' if multi else '') + f'{"experiment":{w}s} {"n":>3s} ' + \
+        ' '.join(f'{m[3:]:>18s}' for m in METRICS) + f' {"min/run":>8s}'
+    print(hdr)
+    print('-' * len(hdr))
+    for r in out:
+        cells = []
+        for m in METRICS:
+            if r[m] == '':
+                cells.append(f'{"--":>18s}')
+            elif r[f'{m}_se'] == '':
+                cells.append(f'{float(r[m]):>18.4f}')
+            else:
+                cells.append(f'{float(r[m]):>9.4f} ±{float(r[f"{m}_se"]):7.4f}')
+        mins = '' if r['_minutes'] is None else f'{r["_minutes"]:8.1f}'
+        short = '' if r['n'] >= args.expected else '*'
+        print((f'{r["experiment"]:24s} ' if multi else '') +
+              f'{r["dataset"]:{w}s} {r["n"]:>3d}{short}' + ' '.join(cells) + f' {mins:>8s}')
+        for wmsg in r['_warnings']:
+            print(f'    ! {wmsg}')
+    if any(r['n'] < args.expected for r in out):
+        print(f'\n* fewer than {args.expected} runs so far; those SEs are provisional')
+    if any(r['te_prec_r50'] == '' for r in out):
+        print('-- not recorded by that script (argus_test_optc.py records auc and ap only)')
 
-        ep = mean_se([r['epoch'] for r in runs if 'epoch' in r])
-        row['epoch'] = f'{ep[0]:.4f}' if ep[0] is not None else ''
-
-        for src, dst in RENAME.items():
-            mu, se, n = mean_se([r[src] for r in runs if src in r])
-            row[dst] = f'{mu:.4f}' if mu is not None else ''
-            row[f'{dst}_se'] = f'{se:.4f}' if se is not None else ''
-        out_rows.append(row)
-        print(f'  {ds:34s} n={len(runs):3d} from {len(files[key])} file(s)')
-
-    with open(args.csv, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction='ignore')
-        w.writeheader()
-        w.writerows(out_rows)
-    print(f'\nWrote {args.csv}  ({len(out_rows)} rows, columns identical to '
-          f'show_main_results.py --csv)')
-
-    if args.table:
-        print()
-        hdr = f'{"dataset":34s} {"n":>4s} ' + ' '.join(f'{m[3:]:>20s}' for m in METRICS)
-        print(hdr)
-        print('-' * len(hdr))
-        for r in out_rows:
-            cells = []
-            for m in METRICS:
-                if r[m] == '':
-                    cells.append(f'{"--":>20s}')
-                elif r[f'{m}_se'] == '':
-                    cells.append(f'{float(r[m]):>20.4f}')
-                else:
-                    cells.append(f'{float(r[m]):>11.4f} +-{float(r[f"{m}_se"]):7.4f}')
-            print(f'{r["dataset"]:34s} {r["n"]:>4d} ' + ' '.join(cells))
-        print('\nte_prec_r50 / te_fp_day_r50 are "--" for OpTC: argus_test_optc.py records only '
-              'auc and ap.')
+    if args.csv:
+        with open(args.csv, 'w', newline='') as f:
+            wr = csv.DictWriter(f, fieldnames=FIELDS, extrasaction='ignore')
+            wr.writeheader()
+            wr.writerows(out)
+        print(f'\nwrote {args.csv}')
 
 
 if __name__ == '__main__':

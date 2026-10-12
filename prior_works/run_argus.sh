@@ -27,7 +27,7 @@ set -uo pipefail
 
 SEEDS=${SEEDS:-5}
 SEED0=${SEED0:-1}                # seeds SEED0 .. SEED0+SEEDS-1
-OUTDIR=${OUTDIR:-../results/argus}
+OUTDIR=${OUTDIR:-results/argus}
 TAG=${TAG:-""}                   # variant suffix on the results file, e.g. _b0
 EXTRA=${EXTRA:-""}               # flags appended to every job
 

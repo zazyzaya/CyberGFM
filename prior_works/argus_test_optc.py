@@ -293,7 +293,7 @@ def train(tr, va, te, args):
 
             # Tracked without using validation, because validation does not track test here.
             # Data snooping: an upper bound, reported separately, never as the headline.
-            if auc > best_snooped[0]:
+            if ap > best_snooped[1]:
                 best_snooped = (auc, ap)
 
             if no_progress > args.patience:

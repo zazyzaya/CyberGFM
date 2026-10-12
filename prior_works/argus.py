@@ -453,49 +453,51 @@ def append_result(path, row):
             f.flush()
             os.fsync(f.fileno())               # visible to a reader on another node
         finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            _unlock(f)
     return path
 
 
 def build_once(paths, build):
     '''
-    Load the cached objects at `paths`, building them exactly once across concurrent jobs.
+    Load the cached objects at `paths`, building them if they are missing. No locks.
 
-    Five seed jobs start together and all find the cache missing. Without this they all build it
-    and all torch.save to the same paths at once; torch.save is not atomic, so a reader can load
-    a truncated archive. Here one job builds while the rest block on `<first path>.lock`, then
-    re-check and load what it wrote. Writes go to a temporary and are os.replace'd into place, so
-    a job killed mid-build leaves no half-written cache.
+    Several seed jobs start together and all find the cache missing. Each builds it and writes
+    to a temporary named for its host and pid, then os.replace()s it into place. The rename is
+    atomic, including on NFS within one directory, so a reader always gets one complete file,
+    never a half-written one. The cost is that the first wave of jobs may each build the cache
+    once, a few minutes of CPU at most. After that every job just loads it.
 
-    The lock file is unlinked BEFORE it is released, so it never outlives the build. That is safe
-    because the only thing it guards -- "does the cache exist yet" -- goes from false to true and
-    never back: a job still waiting on the unlinked file re-checks after acquiring it, finds the
-    cache, and loads it; a job arriving later sees the cache before it ever looks for the lock.
+    This used to take an exclusive lock on a sidecar .lock file and delete the file afterwards.
+    On NFS that breaks either way round: deleting a file you hold a lock on fails the unlock
+    with ENOLCK, and deleting it while another job waits on the lock gives that job ESTALE.
+    Building concurrently and renaming atomically needs no lock, so no lock file is left behind.
     '''
     def ready():
         return all(os.path.exists(p) and os.path.getsize(p) > 0 for p in paths)
 
-    if not ready():
-        lock = f'{paths[0]}.lock'
-        os.makedirs(os.path.dirname(os.path.abspath(lock)), exist_ok=True)
-        with open(lock, 'a') as lf:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-            try:
-                if not ready():                # another job may have built it while we waited
-                    objs = build()
-                    for p, obj in zip(paths, objs):
-                        tmp = f'{p}.tmp{os.getpid()}'
-                        torch.save(obj, tmp)
-                        os.replace(tmp, p)
-                    print(f'built {", ".join(paths)}', flush=True)
-                    return list(objs)
-            finally:
-                try:
-                    os.unlink(lock)
-                except FileNotFoundError:
-                    pass
-                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-    return [torch.load(p, weights_only=False) for p in paths]
+    if ready():
+        return [torch.load(p, weights_only=False) for p in paths]
+
+    built = list(build())
+    tag = f'{socket.gethostname()}.{os.getpid()}'      # pids repeat across nodes
+    for p, obj in zip(paths, built):
+        os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+        tmp = f'{p}.tmp.{tag}'
+        torch.save(obj, tmp)
+        os.replace(tmp, p)
+    print(f'built {", ".join(paths)}', flush=True)
+    return built
+
+
+def _unlock(f):
+    '''
+    Release a flock. Closing the descriptor releases it regardless, so a failure here is never
+    fatal: on NFS (flock is emulated with POSIX locks) an explicit unlock can return ENOLCK.
+    '''
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
 
 
 def run_record(args, seed, minutes, **extra):

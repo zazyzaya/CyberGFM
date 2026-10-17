@@ -71,7 +71,8 @@ from sklearn.metrics import \
 # CONVENTION: decode() is a reconstruction probability where HIGH MEANS NORMAL, so the anomaly
 # score is its negation. This file used to keep its own copy, which had drifted badly -- it was
 # still training with inverted polarity and an unbounded decoder.
-from argus import Argus, SOAP, chunked_forward, append_result, build_once, run_record
+from argus import (Argus, SOAP, chunked_forward, append_result, build_once, run_record,
+                   snap_ews, std_edge_w, use_edge_weights)
 
 
 def seed_everything(seed):
@@ -98,12 +99,15 @@ def to_snapshots(g, ts, add_csr=False):
 
     raw_edge_attr = torch.ones((ei.size(1), 1))   # OpTC has no edge features
 
-    eis, eas, idxs, ptrs, cnts, y = [], [], [], [], [], []
+    eis, eas, ews, idxs, ptrs, cnts, y = [], [], [], [], [], [], []
     for t in ts:
         mask = ts_g == t
         eis.append(ei[:, mask])
         eas.append(raw_edge_attr[mask])
         cnts.append(cnt[mask])
+        # The snapshot is already deduplicated, with the multiplicity in cnt. Their edge weight is
+        # std_edge_w of that count, computed per snapshot.
+        ews.append(std_edge_w(cnt[mask]))
 
         if add_csr:
             csr_dict = defaultdict(list)
@@ -122,7 +126,7 @@ def to_snapshots(g, ts, add_csr=False):
             y.append(labels[mask])
 
     return Data(x=torch.eye(g.x.size(0)), edge_index=eis, label=y, eas=eas,
-                idxs=idxs, ptrs=ptrs, cnts=cnts)
+                idxs=idxs, ptrs=ptrs, cnts=cnts, ews=ews)
 
 
 def check_split(splits, ts_tr, mode):
@@ -160,7 +164,8 @@ def load_splits(args):
     argus.build_once). The split mode is in the name: the test snapshots sit on a different time
     axis in each mode, so a cache built for one must never be loaded by the other.
     '''
-    paths = [f'{args.cache}/{args.dataset}-{args.split}_{n}.pt' for n in ('tr', 'va', 'te')]
+    # _ew: snapshots carry edge weights; older caches do not
+    paths = [f'{args.cache}/{args.dataset}-{args.split}_ew_{n}.pt' for n in ('tr', 'va', 'te')]
 
     def build():
         splits = {}
@@ -209,7 +214,8 @@ def train(tr, va, te, args):
             st = time.time()
             zs = model.forward(tr.x, tr.edge_index[st_i:en_i], tr.eas[st_i:en_i],
                                tr.idxs[st_i:en_i] if tr.idxs else [],
-                               tr.ptrs[st_i:en_i] if tr.ptrs else [])
+                               tr.ptrs[st_i:en_i] if tr.ptrs else [],
+                               ews=snap_ews(tr, st_i, en_i))
             fwd_time += time.time() - st
 
             st = time.time()
@@ -346,6 +352,11 @@ if __name__ == '__main__':
                          'is a GUESS; --beta 0 reproduces their code exactly')
     ap.add_argument('--gamma', type=float, default=0.1,
                     help='APLoss moving-average factor (paper: 0.1 for OpTC)')
+    ap.add_argument('--no-edge-weight', action='store_true',
+                    help='do not pass edge weights to the GCN layers. With them (the default) each '
+                         'snapshot is deduplicated and a (src, dst) pair is weighted by std_edge_w '
+                         'of its event count, as their Argus_LANL does; this is the ablation, and '
+                         'what every run before the edge-weight change did')
     ap.add_argument('--aggregate', action='store_true',
                     help='apply the neighbour aggregation before decoding. Their repo defines it '
                          '(inner_forward_sm) and never calls it, so it is OFF by default')
@@ -387,6 +398,7 @@ if __name__ == '__main__':
         torch.set_num_threads(args.threads)
 
     tr, va, te = load_splits(args)
+    use_edge_weights(args, tr, va, te)
     if args.prepare:
         print(f'{len(tr.edge_index)} train / {len(va.edge_index)} val / {len(te.edge_index)} test '
               f'snapshots. Cache ready.')

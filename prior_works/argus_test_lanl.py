@@ -14,7 +14,8 @@ from sklearn.metrics import \
 
 # The model, APLoss, the GRU wrapper and SOAP all live in argus.py, so every Argus script
 # shares one definition and a fix lands everywhere at once.
-from argus import Argus, SOAP, append_result, build_once, run_record
+from argus import (Argus, SOAP, append_result, build_once, run_record, snap_ews,
+                   use_edge_weights)
 
 sys.path.insert(0, '..')
 from metrics import detection_metrics  # noqa: E402  -- same module the CyberGFM runs use
@@ -60,6 +61,10 @@ def get_args():
                          'is a GUESS; --beta 0 reproduces their code exactly')
     ap.add_argument('--gamma', type=float, default=0.01,
                     help='APLoss moving-average factor (paper: 0.01 for LANL)')
+    ap.add_argument('--no-edge-weight', action='store_true',
+                    help='do not pass edge weights to the GCN layers. Their Argus_LANL does '
+                         '(std_edge_w of the hourly count, the CSR\'s edge_weight); this is the '
+                         'ablation, and what every run before the edge-weight rebuild did')
     ap.add_argument('--aggregate', action='store_true',
                     help='apply the neighbour aggregation before decoding. Their repo defines it '
                          '(inner_forward_sm) and never calls it, so it is OFF by default')
@@ -142,9 +147,15 @@ def masked_graph(g, mask, is_mal):
         src=src[mask],
         col=g.col[mask],
         ts=g.ts[mask] // (60 * 60),          # to_snapshots buckets by hour
-        raw_edge_attr=g.raw_edge_attr[mask],
+        raw_edge_attr=edge_feats(g)[mask],
         label=is_mal[mask].long(),
+        **({'edge_weight': g.edge_weight[mask]} if 'edge_weight' in g else {}),
     )
+
+
+def edge_feats(g):
+    '''Older raw CSRs call the Argus features raw_edge_attr; the rebuilt one calls them edge_attr.'''
+    return g.raw_edge_attr if 'raw_edge_attr' in g else g.edge_attr
 
 
 def build_splits(args):
@@ -174,6 +185,7 @@ def to_snapshots(g, ts=None, add_csr=False, last_ts=None):
 
     eis = []
     eas = []
+    ews = []
     idxs = []
     ptrs = []
     y = []
@@ -187,6 +199,8 @@ def to_snapshots(g, ts=None, add_csr=False, last_ts=None):
 
         eis.append(ei_t)
         eas.append(ea_t)
+        if 'edge_weight' in g:
+            ews.append(g.edge_weight[mask])
 
         idx = [0]
         ptr = []
@@ -212,7 +226,8 @@ def to_snapshots(g, ts=None, add_csr=False, last_ts=None):
     # snapshot_ts: the hour each snapshot covers, kept so fp_day can be normalised by the span of
     # test traffic. to_snapshots emits one entry per t in `ts`, so index i <-> snapshot_ts[i].
     kept = torch.as_tensor([int(t) for t in ts if not (last_ts and t > last_ts)])
-    return Data(x=x, edge_index=eis, label=y, eas=eas, idxs=idxs, ptrs=ptrs, snapshot_ts=kept)
+    return Data(x=x, edge_index=eis, label=y, eas=eas, ews=ews or None, idxs=idxs, ptrs=ptrs,
+                snapshot_ts=kept)
 
 def probe_memory(tr, args):
     """
@@ -307,7 +322,7 @@ def train(tr, va, te, args):
 
             st = time.time()
             print("Fwd", end='', flush=True)
-            zs, h = model.forward(tr.x, tr.edge_index[st_i:en_i], tr.eas[st_i:en_i], tr.idxs[st_i:en_i], tr.ptrs[st_i:en_i], h0=h, include_h=True)
+            zs, h = model.forward(tr.x, tr.edge_index[st_i:en_i], tr.eas[st_i:en_i], tr.idxs[st_i:en_i], tr.ptrs[st_i:en_i], h0=h, include_h=True, ews=snap_ews(tr, st_i, en_i))
             fwd_time += time.time() - st
             print(f' ({((fwd_time) / 60):0.2f} mins)')
 
@@ -339,7 +354,7 @@ def train(tr, va, te, args):
 
         with torch.no_grad():
             model.eval()
-            zs = model.forward(tr.x, tr.edge_index, tr.eas, tr.idxs, tr.ptrs)
+            zs = model.forward(tr.x, tr.edge_index, tr.eas, tr.idxs, tr.ptrs, ews=snap_ews(tr))
             # was zs[:42] -- a leftover from the 42-hour temporal window that validated on 42 of
             # the 352 snapshots of this random split, for no reason and with a weaker signal.
             pos,neg = model.validate(zs, va.edge_index)
@@ -422,8 +437,9 @@ if __name__ == '__main__':
     # cache key carries everything that changes the partition, so switching --val-frac,
     # --test-frac or --split-seed rebuilds instead of silently reusing the wrong split
     cache = (f'{args.cache}/argus_{args.dataset}_v{args.val_frac:g}_t{args.test_frac:g}'
-             f'_s{args.split_seed}{"_agg" if args.aggregate else ""}.pt')
+             f'_s{args.split_seed}{"_agg" if args.aggregate else ""}_v4.pt')   # v4: edge weights
     (tr, va, te), = build_once([cache], lambda: [build_splits(args)])
+    use_edge_weights(args, tr, va, te)
 
     if args.threads:
         torch.set_num_threads(args.threads)

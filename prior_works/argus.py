@@ -257,23 +257,28 @@ class Argus(nn.Module):
         self.max_pos = max_pos
 
     # -- embedding ------------------------------------------------------------------------------
-    def forward(self, x, eis, eas, idxs, ptrs, h0=None, include_h=False):
+    def forward(self, x, eis, eas, idxs, ptrs, h0=None, include_h=False, ews=None):
         '''
         eis/eas are per-snapshot edge indices and edge attributes. Returns (T, N, z), and with
         include_h also the final hidden state so the caller can continue the recurrence.
+
+        ews, when given, are per-snapshot edge weights for the three GCN layers, as their
+        Argus_LANL.forward_once passes them (`edge_weight=ew`, std_edge_w of the hourly count).
+        GCNConv(add_self_loops=True) adds the missing self-loops itself, with weight 1, so with
+        ews=None this is exactly the old explicit add_remaining_self_loops call.
         '''
         x = x.to(self.device)
         eis = [ei.to(self.device) for ei in eis]
         eas = [ea.to(self.device) for ea in eas]
+        ews = [None] * len(eis) if ews is None else [ew.to(self.device).float() for ew in ews]
 
         zs = []
-        for ei, ea in zip(eis, eas):
-            ei_self_loops = add_remaining_self_loops(ei)[0]
-            z = self.c1(x, ei_self_loops)
-            z = self.c2(z, ei_self_loops)
+        for ei, ea, ew in zip(eis, eas, ews):
+            z = self.c1(x, ei, edge_weight=ew)
+            z = self.c2(z, ei, edge_weight=ew)
             z = self.relu(z)
             z = self.drop(z)
-            z = self.c3(z, ei_self_loops)
+            z = self.c3(z, ei, edge_weight=ew)
             z = self.relu(z)
             z = self.drop(z)
             z = self.c4(z, ei, edge_attr=ea)
@@ -399,6 +404,47 @@ class Argus(nn.Module):
 ArgusTS = Argus
 
 
+def std_edge_w(cnt):
+    '''
+    Their lanl_preprocess/load_utils.std_edge_w for one snapshot: sigmoid(floor(c / std(c))).
+
+    Most edges come out at sigmoid(0) = 0.5 and busy ones saturate toward 1 -- a much flatter
+    weighting than the raw count a multigraph implies. Their code divides by a NaN or zero std when
+    a snapshot has one edge or all-equal counts; those snapshots get a uniform 0.5 instead.
+    '''
+    c = cnt.float()
+    std = c.std() if c.numel() > 1 else c.new_tensor(float('nan'))
+    if not torch.isfinite(std) or std == 0:
+        return torch.full_like(c, 0.5)
+    return torch.sigmoid((c.long() / std).long().float())
+
+
+def snap_ews(split, st=None, en=None):
+    '''split.ews[st:en], or None when the split has no edge weights (OpTC, UNSW, old caches).'''
+    ews = getattr(split, 'ews', None)
+    return ews[st:en] if ews else None
+
+
+def use_edge_weights(args, *splits):
+    '''
+    Apply --no-edge-weight and record whether weights are actually in use.
+
+    args.edge_weight_used ends up in every results row, so runs with and without GCN edge weights
+    are never pooled. A split built from an older CSR has no weights at all; that is reported
+    rather than silently treated as weighted.
+    '''
+    have = all(getattr(s, 'ews', None) for s in splits)
+    if getattr(args, 'no_edge_weight', False):
+        for s in splits:
+            s.ews = None
+        have = False
+    elif not have:
+        print('!! no edge_weight in this CSR -- the GCN layers run unweighted. Rebuild with the '
+              'current lanl_preprocess/argus_to_csr.py to match their Argus_LANL.')
+    args.edge_weight_used = have
+    print(f'GCN edge weights: {"on" if have else "off"}')
+
+
 def chunked_forward(model, x, split, chunk, h0=None):
     '''
     Embed a split's snapshots in chunks of `chunk`, threading the GRU state across the seams.
@@ -414,7 +460,7 @@ def chunked_forward(model, x, split, chunk, h0=None):
         out, h = model.forward(x, split.edge_index[st:en], split.eas[st:en],
                                split.idxs[st:en] if split.idxs else [],
                                split.ptrs[st:en] if split.ptrs else [],
-                               h0=h, include_h=True)
+                               h0=h, include_h=True, ews=snap_ews(split, st, en))
         zs.append(out)
     return torch.cat(zs, dim=0), h
 
@@ -511,6 +557,8 @@ def run_record(args, seed, minutes, **extra):
                margin=args.margin, gamma=args.gamma, beta=args.beta, s=args.s,
                aggregate=int(args.aggregate), neg_sampling=args.neg_sampling,
                neg_filter=int(not args.no_neg_filter), epochs=args.epochs, patience=args.patience,
+               # 1 only when GCN edge weights were actually fed; OpTC/UNSW have none
+               edge_weight=int(getattr(args, 'edge_weight_used', False)),
                host=socket.gethostname(), finished=datetime.now().isoformat(timespec='seconds'),
                minutes=round(minutes, 2))
     return rec

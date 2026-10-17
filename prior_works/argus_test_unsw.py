@@ -76,7 +76,8 @@ from sklearn.metrics import \
     average_precision_score as ap_score
 
 # One shared model definition; a fix there lands in every Argus script at once.
-from argus import Argus, SOAP, append_result, run_record
+from argus import (Argus, SOAP, append_result, run_record, snap_ews, std_edge_w,
+                   use_edge_weights)
 
 sys.path.insert(0, '..')
 from metrics import detection_metrics  # noqa: E402  -- same module the CyberGFM runs use
@@ -122,6 +123,11 @@ def get_args():
                          'is a GUESS; --beta 0 reproduces their code exactly')
     ap.add_argument('--gamma', type=float, default=0.1,
                     help='APLoss moving-average factor (NOT in the paper; 0.1 is what this file hardcoded, matching OpTC)')
+    ap.add_argument('--no-edge-weight', action='store_true',
+                    help='do not pass edge weights to the GCN layers. With them (the default) each '
+                         'snapshot is deduplicated and a (src, dst) pair is weighted by std_edge_w '
+                         'of its event count, as their Argus_LANL does; this is the ablation, and '
+                         'what every run before the edge-weight change did')
     ap.add_argument('--aggregate', action='store_true',
                     help='apply the neighbour aggregation before decoding. Their repo defines it '
                          '(inner_forward_sm) and never calls it, so it is OFF by default')
@@ -145,9 +151,32 @@ def get_args():
     return ap.parse_args()
 
 
-def to_snapshots(g, ts, add_csr=False, feat_max=None):
+def dedup_snapshot(ei_t, ea_t, y_t=None):
+    '''
+    Collapse repeated (src, dst) pairs in one snapshot, as their LANL loader does per window.
+
+    Features become the pair's mean, the label its max, and the multiplicity is returned so the
+    caller can weight the edge by std_edge_w(count) instead of by repetition.
+    '''
+    if ei_t.size(1) == 0:
+        return ei_t, ea_t, y_t, torch.zeros(0, dtype=torch.long)
+    uniq, inv, cnt = ei_t.unique(dim=1, return_inverse=True, return_counts=True)
+    ea = torch.zeros(uniq.size(1), ea_t.size(1), dtype=ea_t.dtype).index_add_(0, inv, ea_t)
+    ea = ea / cnt.unsqueeze(1).to(ea.dtype)
+    if y_t is not None:
+        y_t = torch.zeros(uniq.size(1), dtype=y_t.dtype).scatter_reduce_(
+            0, inv, y_t, reduce='amax', include_self=False)
+    return uniq, ea, y_t, cnt
+
+
+def to_snapshots(g, ts, add_csr=False, feat_max=None, dedup=False):
     '''
     Bucket a split's edges by timestamp onto the axis `ts`.
+
+    dedup=True (the training split, the only one fed to the model) collapses repeated pairs per
+    snapshot and attaches std_edge_w(count) as `ews`. Validation and test stay per event: a pair's
+    duplicates all get the same score, so scoring each one is the per-event metric, the same
+    denominator the CyberGFM runs use.
 
     feat_max is the per-column maximum used to normalise the edge features. It MUST come from the
     training split for all three calls: normalising each split by its own maximum put them on
@@ -161,12 +190,17 @@ def to_snapshots(g, ts, add_csr=False, feat_max=None):
     feat_max[feat_max == 0] = 1.0            # a constant-zero column must not divide by zero
     ea_all = g.raw_edge_attr / feat_max
 
-    eis, eas, idxs, ptrs, y = [], [], [], [], []
+    has_y = 'label' in g.keys()
+    eis, eas, ews, idxs, ptrs, y = [], [], [], [], [], []
     for t in ts:
         mask = g.ts == t
-        ei_t = ei[:, mask]
+        ei_t, ea_t = ei[:, mask], ea_all[mask]
+        y_t = g.label[mask] if has_y else None
+        if dedup:
+            ei_t, ea_t, y_t, cnt = dedup_snapshot(ei_t, ea_t, y_t)
+            ews.append(std_edge_w(cnt))
         eis.append(ei_t)
-        eas.append(ea_all[mask])
+        eas.append(ea_t)
 
         if add_csr:
             csr_dict = defaultdict(list)
@@ -180,11 +214,11 @@ def to_snapshots(g, ts, add_csr=False, feat_max=None):
             idxs.append(torch.tensor(idx))
             ptrs.append(torch.tensor(ptr))
 
-        if 'label' in g.keys():
-            y.append(g.label[mask])
+        if has_y:
+            y.append(y_t)
 
     x = torch.eye(g.x.size(0))
-    out = Data(x=x, edge_index=eis, label=y, eas=eas, idxs=idxs, ptrs=ptrs,
+    out = Data(x=x, edge_index=eis, label=y, eas=eas, ews=ews or None, idxs=idxs, ptrs=ptrs,
                snapshot_ts=torch.as_tensor(ts))
     return out, feat_max
 
@@ -218,7 +252,8 @@ def train(tr, va, te, args):
             st = time.time()
             zs = model.forward(tr.x, tr.edge_index[st_i:en_i], tr.eas[st_i:en_i],
                                tr.idxs[st_i:en_i] if tr.idxs else [],
-                               tr.ptrs[st_i:en_i] if tr.ptrs else [])
+                               tr.ptrs[st_i:en_i] if tr.ptrs else [],
+                               ews=snap_ews(tr, st_i, en_i))
             fwd_time += time.time() - st
 
             st = time.time()
@@ -242,7 +277,7 @@ def train(tr, va, te, args):
 
         with torch.no_grad():
             model.eval()
-            zs = model.forward(tr.x, tr.edge_index, tr.eas, tr.idxs, tr.ptrs)
+            zs = model.forward(tr.x, tr.edge_index, tr.eas, tr.idxs, tr.ptrs, ews=snap_ews(tr))
 
             # Validation is a LINK-PREDICTION metric: observed edges vs. random pairs, scored on
             # the RAW reconstruction probability with observed edges as the positive class. It is
@@ -312,9 +347,12 @@ if __name__ == '__main__':
         raise SystemExit('the test split has no `label`, so no detection metric is computable. '
                          'Rebuild it with preprocess_unsw.py:partition_tgraph.')
     ts = raw['tr'].ts.unique()                       # legitimate here: the split is random
-    tr, feat_max = to_snapshots(raw['tr'], ts, add_csr=True)
+    # Only the snapshots the model is fed are deduplicated; --no-edge-weight keeps the multigraph,
+    # exactly as before. feat_max comes from the raw training edges either way.
+    tr, feat_max = to_snapshots(raw['tr'], ts, add_csr=True, dedup=not args.no_edge_weight)
     va, _ = to_snapshots(raw['va'], ts, feat_max=feat_max)   # training scale, not their own
     te, _ = to_snapshots(raw['te'], ts, feat_max=feat_max)
+    use_edge_weights(args, tr)
 
     out = f'{args.out_dir}/unsw{args.tag}.csv'
     for r in range(args.runs):

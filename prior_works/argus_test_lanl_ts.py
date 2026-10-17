@@ -41,7 +41,8 @@ from torch_geometric.data import Data
 
 # One shared model definition; see argus.py for the six fixes and the score convention
 # (decode() is a reconstruction probability -- HIGH MEANS NORMAL, so detection negates).
-from argus import Argus, SOAP, append_result, build_once, run_record
+from argus import (Argus, SOAP, append_result, build_once, run_record, snap_ews,
+                   use_edge_weights)
 
 sys.path.insert(0, '..')
 from metrics import prevalence, threshold_metrics  # noqa: E402
@@ -117,11 +118,16 @@ def snapshots(g, mask, is_mal, hours, add_csr=True):
     ei = torch.stack([src, g.col])
     hrs = g.ts // HOUR
 
-    eis, eas, ys, idxs, ptrs = [], [], [], [], []
+    feats = g.raw_edge_attr if 'raw_edge_attr' in g else g.edge_attr   # older CSRs vs the rebuild
+    has_ew = 'edge_weight' in g
+
+    eis, eas, ews, ys, idxs, ptrs = [], [], [], [], [], []
     for h in hours:
         m = mask & (hrs == h)
         eis.append(ei[:, m])
-        eas.append(g.raw_edge_attr[m].float())
+        eas.append(feats[m].float())
+        if has_ew:
+            ews.append(g.edge_weight[m].float())
         ys.append(is_mal[m])
 
         if add_csr:
@@ -136,7 +142,8 @@ def snapshots(g, mask, is_mal, hours, add_csr=True):
             idxs.append(torch.tensor(idx))
             ptrs.append(torch.tensor(ptr))
 
-    return Data(x=torch.eye(g.x.size(0)), edge_index=eis, eas=eas, label=ys, idxs=idxs, ptrs=ptrs)
+    return Data(x=torch.eye(g.x.size(0)), edge_index=eis, eas=eas, ews=ews or None, label=ys,
+                idxs=idxs, ptrs=ptrs)
 
 
 def build_splits(csr, cutoff_hours, val_frac, scrub, seed=0):
@@ -195,7 +202,8 @@ def rolling_pass(model, x, stages, chunk, keep_edges=False, score_mode='contempo
         for st in range(0, n, chunk):
             en = min(st + chunk, n)
             zs, h = model(x, feed.edge_index[st:en], feed.eas[st:en],
-                          feed.idxs[st:en], feed.ptrs[st:en], h0=h, include_h=True)
+                          feed.idxs[st:en], feed.ptrs[st:en], h0=h, include_h=True,
+                          ews=snap_ews(feed, st, en))
             h = h.detach()
 
             for j in range(st, en):
@@ -334,7 +342,7 @@ def probe_memory(tr, args):
         try:
             opt.zero_grad()
             zs, _ = model(tr.x, tr.edge_index[:c], tr.eas[:c], tr.idxs[:c], tr.ptrs[:c],
-                          h0=None, include_h=True)
+                          h0=None, include_h=True, ews=snap_ews(tr, 0, c))
             model.calc_loss_argus(zs, [ei.to(args.device) for ei in tr.edge_index[:c]]).backward()
             peak = torch.cuda.max_memory_allocated(args.device) / gib
             marg = f'{(peak - prev[1]) / (c - prev[0]):.3f} GiB' if prev else '-'
@@ -390,7 +398,8 @@ def train(tr, va, te, args):
             total = sum(n for _, n in group)
             for i, n in group:
                 zs, h = model(tr.x, tr.edge_index[i:i + n], tr.eas[i:i + n],
-                              tr.idxs[i:i + n], tr.ptrs[i:i + n], h0=h, include_h=True)
+                              tr.idxs[i:i + n], tr.ptrs[i:i + n], h0=h, include_h=True,
+                              ews=snap_ews(tr, i, i + n))
                 loss = model.calc_loss_argus(zs, [ei.to(args.device) for ei in tr.edge_index[i:i + n]])
                 (loss * n / total).backward()
                 # truncated BPTT: the state crosses the chunk boundary, the gradient does not
@@ -468,6 +477,10 @@ if __name__ == '__main__':
                          'is a GUESS; --beta 0 reproduces their code exactly')
     ap.add_argument('--gamma', type=float, default=0.01,
                     help='APLoss moving-average factor (paper: 0.01 for LANL)')
+    ap.add_argument('--no-edge-weight', action='store_true',
+                    help='do not pass edge weights to the GCN layers. Their Argus_LANL does '
+                         '(std_edge_w of the hourly count, the CSR\'s edge_weight); this is the '
+                         'ablation, and what every run before the edge-weight rebuild did')
     ap.add_argument('--aggregate', action='store_true',
                     help='apply the neighbour aggregation before decoding. Their repo defines it '
                          '(inner_forward_sm) and never calls it, so it is OFF by default')
@@ -529,9 +542,11 @@ if __name__ == '__main__':
     split_name = f'lanl14argus-{"clean" if args.scrub else "dirty"}ts-{args.cutoff:g}h'
 
     # v3: train and val now share hours (random edge holdout), so older caches are incompatible
-    cache = f'{args.cache}/argus_{split_name}_vf{args.val_frac:g}_v3.pt'
+    # v4: snapshots carry the CSR's edge weights
+    cache = f'{args.cache}/argus_{split_name}_vf{args.val_frac:g}_v4.pt'
     (tr, va, te), = build_once([cache], lambda: [build_splits(
         args.csr, args.cutoff, args.val_frac, args.scrub, args.split_seed)])
+    use_edge_weights(args, tr, va, te)
     print(f'{len(tr.edge_index)} train/val hours, {len(te.edge_index)} test hours')
 
     assert len(va.edge_index) == len(tr.edge_index), 'train and val snapshots must stay aligned'

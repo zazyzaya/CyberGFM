@@ -76,7 +76,13 @@ command -v bsub >/dev/null || { echo "bsub not found; run this on login01/login0
 
 # ---- per-dataset settings ---------------------------------------------------------------------
 #pt_args()     { case "$1" in lanl*) echo "--n-tokens 20" ;; *) echo "" ;; esac; }
-pt_args()     { case "$1" in lanl*) echo "--n-tokens 10" ;; *) echo "" ;; esac; }
+# lanl14argus-ts evaluates every 1000 epochs instead of pretrain.py's 14: its test set is huge, so
+# evaluating is most of its runtime. Matched exactly, so -dirtyts / -cleants keep the default.
+pt_args()     { case "$1" in
+                  lanl14argus-ts) echo "--n-tokens 10 --eval-every 1000" ;;
+                  lanl*)          echo "--n-tokens 10" ;;
+                  *)              echo "" ;;
+                esac; }
 ft_script()   { case "$1" in optc*) echo cls_finetune.py ;; *) echo lp_finetune.py ;; esac; }
 ft_kind()     { case "$1" in optc*) echo cls ;; *) echo lp ;; esac; }
 pt_walk_len() { case "$1" in lanl*) echo 4 ;; *) echo 64 ;; esac; }

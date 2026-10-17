@@ -39,7 +39,7 @@ RENAME = {'auc': 'te_auc', 'ap': 'te_ap', 'prec_r50': 'te_prec_r50', 'fp_day_r50
 # Pooling rows that differ in any of these would average two different experiments together.
 HYPER = ['lr', 'h_dim', 'z_dim', 'gru_layers', 'margin', 'gamma', 'beta', 's', 'aggregate',
          'neg_sampling', 'neg_filter', 'epochs', 'patience', 'split', 'score_mode', 'ts_div',
-         'cutoff', 'scrub']
+         'cutoff', 'scrub', 'edge_weight']
 
 IGNORE = re.compile(r'(^speedtest|^argus_speedtest|_log$|^argus_main$)')
 

@@ -310,7 +310,7 @@ def load_partial_lanl(start=140000, end=156659, delta=8640, is_test=False, use_f
         in_f.close()
         cur_slice += FILE_DELTA
 
-        if os.path.exists(LANL_FOLDER + str(cur_slice) + '.txt'):
+        if os.path.exists(LANL_FOLDER + '/auth/' + str(cur_slice) + '.txt'):
             in_f = open(LANL_FOLDER + '/auth/' + str(cur_slice) + '.txt', 'r')
             line = in_f.readline()
             if use_flows:

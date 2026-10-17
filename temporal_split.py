@@ -52,7 +52,10 @@ def temporally_partition_lanl_tgraph():
             label = label[mask]
             data.label = label
 
-        torch.save(data, f'data/lanl14argus-ts_tgraph_{name}.pt')
+        fn = f'data/lanl14argus-ts_tgraph_{name}.pt'
+        torch.save(data, fn)
+
+        print(f'{fn}: {data.col.size(0)} edges')
 
 def temporally_split_dirty_lanl_tgraph(tr_days=7):
     torch.manual_seed(0)
@@ -100,8 +103,10 @@ def temporally_split_dirty_lanl_tgraph(tr_days=7):
             label = label[mask]
             data.label = label
 
-        torch.save(data, f'data/lanl14argus-dirtyts_tgraph_{name}.pt')
+        fn = f'data/lanl14argus-dirtyts_tgraph_{name}.pt'
+        torch.save(data, fn)
 
+        print(f'{fn}: {data.col.size(0)} edges')
 
 # Generate new index pointer for subset of column that was selected
 def reindex(idxptr, subset_mask):

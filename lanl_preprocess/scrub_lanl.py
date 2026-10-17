@@ -31,6 +31,8 @@ def build(g, mask, label=None):
     row = torch.arange(g.x.size(0)).repeat_interleave(deg)
     data = Data(x=g.x, idxptr=new_ptr, col=g.col[mask], src=row, ts=g.ts[mask],
                 edge_attr=g.edge_attr[mask])
+    if getattr(g, 'edge_weight', None) is not None:
+        data.edge_weight = g.edge_weight[mask]
     if label is not None:
         data.label = label[mask]
     return data

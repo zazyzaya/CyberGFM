@@ -43,6 +43,8 @@ def temporally_partition_lanl_tgraph():
             ts = g.ts[mask],
             edge_attr = g.edge_attr[mask]
         )
+        if getattr(g, 'edge_weight', None) is not None:
+            data.edge_weight = g.edge_weight[mask]
 
         if name == 'te':
             label = torch.zeros(mask.size(0))
@@ -89,6 +91,8 @@ def temporally_split_dirty_lanl_tgraph(tr_days=7):
             ts = g.ts[mask],
             edge_attr = g.edge_attr[mask]
         )
+        if getattr(g, 'edge_weight', None) is not None:
+            data.edge_weight = g.edge_weight[mask]
 
         if name == 'te':
             label = torch.zeros(mask.size(0))
@@ -189,5 +193,5 @@ def temporally_partition_argus_optc_tgraph():
 
 
 if __name__ == '__main__':
-    temporally_split_dirty_lanl_tgraph(tr_days=8)
+    temporally_split_dirty_lanl_tgraph(tr_days=7)
     temporally_partition_lanl_tgraph()

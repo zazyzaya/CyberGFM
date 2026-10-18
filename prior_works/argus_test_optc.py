@@ -164,8 +164,9 @@ def load_splits(args):
     argus.build_once). The split mode is in the name: the test snapshots sit on a different time
     axis in each mode, so a cache built for one must never be loaded by the other.
     '''
-    # _ew: snapshots carry edge weights; older caches do not
-    paths = [f'{args.cache}/{args.dataset}-{args.split}_ew_{n}.pt' for n in ('tr', 'va', 'te')]
+    # _ew: snapshots carry edge weights; _sym: optc-argus test edges are undirected like training
+    # (load_argus_data.py). Older caches lack one or the other.
+    paths = [f'{args.cache}/{args.dataset}-{args.split}_ew_sym_{n}.pt' for n in ('tr', 'va', 'te')]
 
     def build():
         splits = {}

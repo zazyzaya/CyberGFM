@@ -20,6 +20,7 @@
 #   QUEUE_PT=h100 QUEUE_FT=normal ./submit_main_seeds.sh
 #   WLS=match ./submit_main_seeds.sh      # only the pretraining-matched walk lengths
 #   DATASETS=lanl14argus ./submit_main_seeds.sh
+#   ./run_all_hpc.sh --force              # ignore existing checkpoints and results; redo everything
 #
 # Run from the repo root on the submit host (login01/login02).
 set -uo pipefail
@@ -61,13 +62,14 @@ LOGDIR=${LOGDIR:-logs/lsf}
 RESULTS=${RESULTS:-results}
 PRETRAINED=${PRETRAINED:-pretrained}
 
-DRY=0; LIST_ONLY=0; PREFLIGHT=0; PREFLIGHT_ONLY=0
+DRY=0; LIST_ONLY=0; PREFLIGHT=0; PREFLIGHT_ONLY=0; FORCE=0
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --list|-n) LIST_ONLY=1 ;;
     --preflight) PREFLIGHT_ONLY=1 ;;
     --no-preflight) PREFLIGHT=0 ;;
+    --force) FORCE=1 ;;   # resubmit every cell, overwriting checkpoints and results CSVs
     *) echo "unknown option: $a" >&2; exit 1 ;;
   esac
 done
@@ -79,7 +81,7 @@ command -v bsub >/dev/null || { echo "bsub not found; run this on login01/login0
 # lanl14argus-ts evaluates every 1000 epochs instead of pretrain.py's 14: its test set is huge, so
 # evaluating is most of its runtime. Matched exactly, so -dirtyts / -cleants keep the default.
 pt_args()     { case "$1" in
-                  lanl14argus-ts) echo "--n-tokens 10 --eval-every 1000" ;;
+                  lanl14argus-ts) echo "--n-tokens 10 --eval-every 100" ;;
                   lanl*)          echo "--n-tokens 10" ;;
                   *)              echo "" ;;
                 esac; }
@@ -221,13 +223,16 @@ for ds in $DATASETS; do
     for s in $PSEEDS; do
       ck=$(ckpt_path "$ds" "$mode" "$s")
       ptname="pt_${mode}_${ds}_ps${s}"
-      if [ -f "$REPO/$ck" ]; then
+      if [ "$FORCE" = 0 ] && [ -f "$REPO/$ck" ]; then
         pt_have=$((pt_have + 1))
       elif [ "$LIST_ONLY" = 1 ]; then
         echo "  pretrain  $ptname"; n_pt=$((n_pt + 1))
       else
         echo "  pretrain  $ptname"
-        jid=$(submit "$ptname" "$QUEUE_PT" "$WALL_PT" "" \
+        # --force: delete the old checkpoints first, so that if this run dies the fine-tunes'
+        # [ -f $ck ] guard skips them rather than silently fine-tuning the OLD model.
+        clear=""; [ "$FORCE" = 1 ] && clear="rm -f $ck ${ck%.pt}-best.pt;"
+        jid=$(submit "$ptname" "$QUEUE_PT" "$WALL_PT" "" $clear \
           python pretrain.py --dataset "$ds" $trw --size "$SIZE" --device 0 \
                  --seed "$s" --tag "_ps${s}" $(pt_args "$ds") $EXTRA_PRETRAIN) || continue
         PT_JOBID["$ptname"]=$jid
@@ -236,7 +241,7 @@ for ds in $DATASETS; do
 
       for wl in $(wls_for "$ds"); do
         csv=$(csv_path "$ds" "$mode" "$s" "$wl")
-        if [ -f "$REPO/$csv" ] && grep -q '^# BEST' "$REPO/$csv" 2>/dev/null; then
+        if [ "$FORCE" = 0 ] && [ -f "$REPO/$csv" ] && grep -q '^# BEST' "$REPO/$csv" 2>/dev/null; then
           ft_have=$((ft_have + 1)); continue
         fi
         ftname="ft_${mode}_${ds}_ps${s}_wl${wl}"
@@ -245,7 +250,10 @@ for ds in $DATASETS; do
         fi
         echo "  finetune  $ftname${PT_JOBID[$ptname]+  (after ${PT_JOBID[$ptname]})}"
         # The guard: if the pretraining failed, exit 0 rather than failing on a missing file.
-        submit "$ftname" "$QUEUE_FT" "$WALL_FT" "${PT_JOBID[$ptname]-}" \
+        # --force: remove the old CSV up front too, so a skipped cell does not leave a stale
+        # "# BEST" file that the next ordinary run would count as finished.
+        clear=""; [ "$FORCE" = 1 ] && clear="rm -f $csv;"
+        submit "$ftname" "$QUEUE_FT" "$WALL_FT" "${PT_JOBID[$ptname]-}" $clear \
           "[ -f $ck ] || { echo 'no checkpoint $ck -- pretraining did not finish; skipping'; exit 0; };" \
           python "$(ft_script "$ds")" --dataset "$ds" $trw --size "$SIZE" --device 0 \
                  --walk-len "$wl" --seed 0 --pretrain-tag "_ps${s}" --tag "_ps${s}_s0" \

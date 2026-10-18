@@ -127,8 +127,8 @@ def summarize(d, name, rows, files, expected):
 
 def main():
     ap = ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('dirs', nargs='*', default=['../results/argus'],
-                    help='results directories to read (default ../results/argus)')
+    ap.add_argument('dirs', nargs='*', default=['results/argus'],
+                    help='results directories to read (default results/argus)')
     ap.add_argument('--csv', help="also write show_main_results.py's --csv format to this path")
     ap.add_argument('--expected', type=int, default=5,
                     help='expected replications per experiment, for the n_expected column')

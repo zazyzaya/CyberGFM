@@ -3,8 +3,8 @@
 #
 #   lanl            argus_test_lanl.py                           random LANL split
 #   lanl_ts         argus_test_lanl_ts.py                        temporal, --cutoff 41
-#   lanl_ts_dirty   argus_test_lanl_ts.py --cutoff 172            attack edges IN training
-#   lanl_ts_clean   argus_test_lanl_ts.py --cutoff 172 --scrub    the same window, scrubbed
+#   lanl_ts_dirty   argus_test_lanl_ts.py --cutoff $CUTOFF        attack edges IN training
+#   lanl_ts_clean   argus_test_lanl_ts.py --cutoff $CUTOFF --scrub the same window, scrubbed
 #   optc            argus_test_optc.py --dataset optc            random OpTC split
 #   optc_argus      argus_test_optc.py --dataset optc-argus      Argus's temporal OpTC split
 #   unsw            argus_test_unsw.py                           random UNSW split
@@ -13,23 +13,42 @@
 # <OUTDIR>/<experiment><TAG>.csv, one row per seed; the job logs go to <OUTDIR>/logs/. Nothing
 # else is written. A (experiment, seed) whose row is already in that file is skipped.
 #
-# The 172h cutoff lines the poisoning arms up with CyberGFM's dirtyts/cleants splits, whose
-# training window ends at ts 619200 = 172.0h. Both arms score the identical test set.
+# CUTOFF (default 168h = temporal_split.py's tr_days=7) lines the poisoning arms up with
+# CyberGFM's dirtyts/cleants splits. Both arms score the identical test set.
 #
 #   ./run_argus.sh                                   # 7 experiments x 5 seeds = 35 jobs
 #   ./run_argus.sh --list                            # what would be submitted
 #   ./run_argus.sh --only optc,optc_argus
 #   OUTDIR=../results/argus-paper-defaults ./run_argus.sh
 #   EXTRA="--beta 0" TAG=_b0 ./run_argus.sh          # a variant, in its own files
+#   PROFILE=code OUTDIR=../results/argus-code ./run_argus.sh
+#                                                    # their released training recipe (below)
+#
+# PROFILE=code appends the flags that make every script train the way their classification.py
+# does: one GRU layer, no L_DEC term, 100 epochs, early stopping at patience 3. The scripts'
+# own defaults follow the PAPER where paper and code disagree (two GRU layers, beta > 0) and
+# train to convergence (1000 epochs, patience 100).
+#
+# CUTOFF is the hour the poisoning arms train up to. It MUST match the CyberGFM dirtyts/cleants
+# files or the two models are scored on different test sets: temporal_split.py builds them with
+# tr_days=7, i.e. 168h (scrub_lanl.py reports the window it inferred). Set CUTOFF=172 only if
+# those files are rebuilt at 7.1667 days.
 #
 #   python show_argus_results.py ../results/argus    # once the jobs finish
 set -uo pipefail
 
 SEEDS=${SEEDS:-5}
 SEED0=${SEED0:-1}                # seeds SEED0 .. SEED0+SEEDS-1
-OUTDIR=${OUTDIR:-results/argus}
+OUTDIR=${OUTDIR:-results/argus}      # relative to prior_works/
 TAG=${TAG:-""}                   # variant suffix on the results file, e.g. _b0
 EXTRA=${EXTRA:-""}               # flags appended to every job
+PROFILE=${PROFILE:-""}           # "code": their released recipe, see the header
+CUTOFF=${CUTOFF:-168}            # poisoning-arm cutoff in hours; must match the CyberGFM files
+case "$PROFILE" in
+  code) EXTRA="--gru-layers 1 --beta 0 --epochs 100 --patience 3 $EXTRA" ;;
+  "")   ;;
+  *) echo "unknown PROFILE '$PROFILE' (use: code)" >&2; exit 1 ;;
+esac
 
 QUEUE=${QUEUE:-normal}
 GPU_RES=${GPU_RES:-"num=1:mode=exclusive_process"}
@@ -58,10 +77,10 @@ NAMES=(lanl lanl_ts lanl_ts_dirty lanl_ts_clean optc optc_argus unsw)
 
 spec() {  # name -> "script|flags|results file stem (what the script names its output)"
   case "$1" in
-    lanl)          echo "argus_test_lanl.py||lanl14argus" ;;
+    lanl)          echo "argus_test_lanl.py|--bs 24|lanl14argus" ;;   # --bs 0 OOMs a 44 GB card
     lanl_ts)       echo "argus_test_lanl_ts.py||lanl14argus-dirtyts-41h" ;;
-    lanl_ts_dirty) echo "argus_test_lanl_ts.py|--cutoff 172|lanl14argus-dirtyts-172h" ;;
-    lanl_ts_clean) echo "argus_test_lanl_ts.py|--cutoff 172 --scrub|lanl14argus-cleants-172h" ;;
+    lanl_ts_dirty) echo "argus_test_lanl_ts.py|--cutoff $CUTOFF|lanl14argus-dirtyts-${CUTOFF}h" ;;
+    lanl_ts_clean) echo "argus_test_lanl_ts.py|--cutoff $CUTOFF --scrub|lanl14argus-cleants-${CUTOFF}h" ;;
     optc)          echo "argus_test_optc.py|--dataset optc|optc" ;;
     optc_argus)    echo "argus_test_optc.py|--dataset optc-argus|optc-argus" ;;
     unsw)          echo "argus_test_unsw.py||unsw" ;;

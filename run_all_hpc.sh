@@ -21,6 +21,8 @@
 #   WLS=match ./submit_main_seeds.sh      # only the pretraining-matched walk lengths
 #   DATASETS=lanl14argus ./submit_main_seeds.sh
 #   ./run_all_hpc.sh --force              # ignore existing checkpoints and results; redo everything
+#   WLS=4 ./run_all_hpc.sh --random       # the from-random-init control: fine-tune only, no
+#                                         # pretraining; one run per PSEED, seeded by it
 #
 # Run from the repo root on the submit host (login01/login02).
 set -uo pipefail
@@ -52,7 +54,7 @@ REPO=${REPO:-$PWD}
 
 # ---- EXPERIMENT MATRIX -- identical to run_main_seeds.sh ---------------------------------------
 PSEEDS=${PSEEDS:-"1 2 3 4 5"}
-DATASETS=${DATASETS:-"lanl14argus-dirtyts lanl14argus-cleants lanl14argus lanl14argus-ts"}
+DATASETS=${DATASETS:-"lanl14argus-dirtyts lanl14argus-cleants lanl14argus lanl14argus-ts optc-argus optc unsw"}
 MODES=${MODES:-"static temporal"}
 WLS=${WLS:-"1 2 4 8"}        # or WLS=match for the pretraining walk length per dataset
 SIZE=${SIZE:-tiny}
@@ -62,7 +64,7 @@ LOGDIR=${LOGDIR:-logs/lsf}
 RESULTS=${RESULTS:-results}
 PRETRAINED=${PRETRAINED:-pretrained}
 
-DRY=0; LIST_ONLY=0; PREFLIGHT=0; PREFLIGHT_ONLY=0; FORCE=0
+DRY=0; LIST_ONLY=0; PREFLIGHT=0; PREFLIGHT_ONLY=0; FORCE=0; RANDOM_INIT=0
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
@@ -70,6 +72,7 @@ for a in "$@"; do
     --preflight) PREFLIGHT_ONLY=1 ;;
     --no-preflight) PREFLIGHT=0 ;;
     --force) FORCE=1 ;;   # resubmit every cell, overwriting checkpoints and results CSVs
+    --random) RANDOM_INIT=1 ;;   # fine-tune from random init (--from-random); no pretraining
     *) echo "unknown option: $a" >&2; exit 1 ;;
   esac
 done
@@ -92,7 +95,9 @@ wls_for()     { if [ "$WLS" = match ]; then pt_walk_len "$1"; else echo "$WLS"; 
 
 ckpt_path() { local pre=rw_bert; [ "$2" = temporal ] && pre=trw_bert
               echo "$PRETRAINED/$2/$1/${pre}_${1}_ps${3}_${SIZE}.pt"; }
-csv_path()  { echo "$RESULTS/$(ft_kind "$1")-$2/$1/$(ft_kind "$1")_ps${3}_${SIZE}_wl${4}_ps${3}_s0.csv"; }
+# rand_init_ is the prefix lp_finetune.py / cls_finetune.py put on --from-random results
+csv_path()  { local pre=""; [ "$RANDOM_INIT" = 1 ] && pre=rand_init_
+              echo "$RESULTS/$(ft_kind "$1")-$2/$1/${pre}$(ft_kind "$1")_ps${3}_${SIZE}_wl${4}_ps${3}_s0.csv"; }
 
 mkdir -p "$LOGDIR"
 
@@ -223,7 +228,9 @@ for ds in $DATASETS; do
     for s in $PSEEDS; do
       ck=$(ckpt_path "$ds" "$mode" "$s")
       ptname="pt_${mode}_${ds}_ps${s}"
-      if [ "$FORCE" = 0 ] && [ -f "$REPO/$ck" ]; then
+      if [ "$RANDOM_INIT" = 1 ]; then
+        :                                  # no pretraining: the fine-tune starts from random init
+      elif [ "$FORCE" = 0 ] && [ -f "$REPO/$ck" ]; then
         pt_have=$((pt_have + 1))
       elif [ "$LIST_ONLY" = 1 ]; then
         echo "  pretrain  $ptname"; n_pt=$((n_pt + 1))
@@ -245,6 +252,13 @@ for ds in $DATASETS; do
           ft_have=$((ft_have + 1)); continue
         fi
         ftname="ft_${mode}_${ds}_ps${s}_wl${wl}"
+        # From random init: no checkpoint to wait for or check, and the seed must vary per run --
+        # with every run at --seed 0 the five "seeds" would be the same run five times.
+        guard="[ -f $ck ] || { echo 'no checkpoint $ck -- pretraining did not finish; skipping'; exit 0; };"
+        ft_seed=0; init=""
+        if [ "$RANDOM_INIT" = 1 ]; then
+          ftname="ft_rand_${mode}_${ds}_ps${s}_wl${wl}"; guard=""; ft_seed=$s; init="--from-random"
+        fi
         if [ "$LIST_ONLY" = 1 ]; then
           echo "  finetune  $ftname"; n_ft=$((n_ft + 1)); continue
         fi
@@ -253,11 +267,10 @@ for ds in $DATASETS; do
         # --force: remove the old CSV up front too, so a skipped cell does not leave a stale
         # "# BEST" file that the next ordinary run would count as finished.
         clear=""; [ "$FORCE" = 1 ] && clear="rm -f $csv;"
-        submit "$ftname" "$QUEUE_FT" "$WALL_FT" "${PT_JOBID[$ptname]-}" $clear \
-          "[ -f $ck ] || { echo 'no checkpoint $ck -- pretraining did not finish; skipping'; exit 0; };" \
+        submit "$ftname" "$QUEUE_FT" "$WALL_FT" "${PT_JOBID[$ptname]-}" $clear "$guard" \
           python "$(ft_script "$ds")" --dataset "$ds" $trw --size "$SIZE" --device 0 \
-                 --walk-len "$wl" --seed 0 --pretrain-tag "_ps${s}" --tag "_ps${s}_s0" \
-                 $EXTRA_FT >/dev/null || true
+                 --walk-len "$wl" --seed "$ft_seed" --pretrain-tag "_ps${s}" --tag "_ps${s}_s0" \
+                 $init $EXTRA_FT >/dev/null || true
         n_ft=$((n_ft + 1))
       done
     done

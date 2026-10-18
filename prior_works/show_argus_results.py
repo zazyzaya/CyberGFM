@@ -37,9 +37,9 @@ for _m in METRICS:
 RENAME = {'auc': 'te_auc', 'ap': 'te_ap', 'prec_r50': 'te_prec_r50', 'fp_day_r50': 'te_fp_day_r50'}
 
 # Pooling rows that differ in any of these would average two different experiments together.
-HYPER = ['lr', 'h_dim', 'z_dim', 'gru_layers', 'margin', 'gamma', 'beta', 's', 'aggregate',
-         'neg_sampling', 'neg_filter', 'epochs', 'patience', 'split', 'score_mode', 'ts_div',
-         'cutoff', 'scrub', 'edge_weight']
+HYPER = ['arch', 'lr', 'h_dim', 'z_dim', 'gru_layers', 'margin', 'gamma', 'beta', 'max_pos',
+         'epochs', 'patience', 'bs', 'score_mode', 'edge_weight', 'undirected', 'split',
+         'cutoff', 'scrub', 'ts_div']
 
 IGNORE = re.compile(r'(^speedtest|^argus_speedtest|_log$|^argus_main$)')
 

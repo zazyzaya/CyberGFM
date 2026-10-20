@@ -61,7 +61,7 @@ SIZE=${SIZE:-tiny}
 EXTRA_PRETRAIN=${EXTRA_PRETRAIN:-""}
 EXTRA_FT=${EXTRA_FT:-""}
 LOGDIR=${LOGDIR:-logs/lsf}
-RESULTS=${RESULTS:-results}
+RESULTS=${RESULTS:-results}     # where fine-tune CSVs go (passed as --out-dir) and are looked for
 PRETRAINED=${PRETRAINED:-pretrained}
 
 DRY=0; LIST_ONLY=0; PREFLIGHT=0; PREFLIGHT_ONLY=0; FORCE=0; RANDOM_INIT=0
@@ -270,7 +270,7 @@ for ds in $DATASETS; do
         submit "$ftname" "$QUEUE_FT" "$WALL_FT" "${PT_JOBID[$ptname]-}" $clear "$guard" \
           python "$(ft_script "$ds")" --dataset "$ds" $trw --size "$SIZE" --device 0 \
                  --walk-len "$wl" --seed "$ft_seed" --pretrain-tag "_ps${s}" --tag "_ps${s}_s0" \
-                 $init $EXTRA_FT >/dev/null || true
+                 --out-dir "$RESULTS/$(ft_kind "$ds")-$mode/$ds" $init $EXTRA_FT >/dev/null || true
         n_ft=$((n_ft + 1))
       done
     done

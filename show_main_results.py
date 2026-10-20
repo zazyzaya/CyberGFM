@@ -22,6 +22,11 @@ the experiment does not have.
     python show_main_results.py --per-seed           # every checkpoint separately
     python show_main_results.py --progress           # what is still running
     python show_main_results.py --csv main.csv
+    python show_main_results.py --no-rand-init       # leave out the from-random-init controls
+
+Runs fine-tuned from random initialisation (lp_finetune.py --from-random, files named rand_init_*)
+are their own experiment, `<experiment>-rand` (e.g. lp-static-rand), so they sit next to the
+pretrained rows rather than being averaged into them.
 
 Run from the repo root.
 '''
@@ -55,13 +60,22 @@ def pt_wl(dataset):
     return DEFAULT_PT_WL
 
 
-def collect(root, ps_re, filt=None, dataset=None):
+RAND_PREFIX = 'rand_init_'   # what lp_finetune.py / cls_finetune.py prepend under --from-random
+
+
+def collect(root, ps_re, filt=None, dataset=None, rand_init=True):
     '''(experiment, dataset, wl, pseed) -> list of runs, one per fine-tuning seed.'''
     runs, skipped = defaultdict(list), []
     for path in sorted(glob.glob(os.path.join(root, '*', '*', '*.csv'))):
         exp, ds = path.split(os.sep)[-3:-1]
         if (dataset and ds != dataset) or (filt and filt not in path):
             continue
+        # A from-random run shares every other part of its name with the pretrained run of the
+        # same seed, so without this it would be averaged in as another fine-tuning seed.
+        if os.path.basename(path).startswith(RAND_PREFIX):
+            if not rand_init:
+                continue
+            exp = f'{exp}-rand'
         m = NAME_RE.match(os.path.basename(path))
         ps = ps_re.search(os.path.basename(path)) if m else None
         if not ps:
@@ -179,6 +193,8 @@ def print_paper_table(agg, how, select_key, expected_n):
                 rows.append([exp, f'wl{wl}', '-', '-', f'0/{expected_n}'])
                 continue
             variant = 'CyberGFM_T' if 'temporal' in exp else 'CyberGFM_S'
+            if exp.endswith('-rand'):
+                variant += ', random init'
             rows.append([f'{variant} ({exp})', f'wl{wl}',
                          fmt('te_auc', *r.get('te_auc', (float('nan'),) * 2)[:2]),
                          fmt('te_ap', *r.get('te_ap', (float('nan'),) * 2)[:2]),
@@ -258,10 +274,13 @@ if __name__ == '__main__':
     ap.add_argument('--include-running', action='store_true',
                     help='count unfinished runs, using their latest epoch')
     ap.add_argument('--csv', help='also write the aggregate to this CSV')
+    ap.add_argument('--no-rand-init', action='store_true',
+                    help='leave out the from-random-init runs (rand_init_* files)')
     args = ap.parse_args()
 
     select_key = f'va_{args.select_by}'
-    runs, skipped = collect(args.root, re.compile(args.ps_pattern), args.filter, args.dataset)
+    runs, skipped = collect(args.root, re.compile(args.ps_pattern), args.filter, args.dataset,
+                            rand_init=not args.no_rand_init)
     if args.wl:
         runs = {k: v for k, v in runs.items() if k[2] in args.wl}
     if not runs:

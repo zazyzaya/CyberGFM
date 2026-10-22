@@ -38,7 +38,7 @@ if __name__ == '__main__':
     ap.add_argument('--walk-len', type=int, default=4)
     ap.add_argument('--delta', type=int, help='temporal walk window (seconds); default 1 day (0 for UNSW)')
     ap.add_argument('--epochs', type=int, default=10)
-    ap.add_argument('--warmup-epochs', type=float, help='default: epochs / 3.75')
+    ap.add_argument('--warmup-epochs', type=float, help='default: epochs / 3.33')
     ap.add_argument('--eval-every', type=int, default=1, help='epochs')
     ap.add_argument('--lr', type=float, default=3e-5)
     ap.add_argument('--wd', type=float, default=0.0)
@@ -78,7 +78,7 @@ if __name__ == '__main__':
         path = args.model_fname or pretrained_path(name, args.size, args.trw, args.poison,
                                                    args.tr_size, best=args.best_pretrained, tag=args.pretrain_tag)
         print('Loading', path)
-        sd = torch.load(path, weights_only=True)
+        sd = torch.load(path, weights_only=True, map_location='cpu')
     model = RWBertFT(bert_config(name, tr, args.size), sd, device=device, from_random=args.from_random)
 
     updates_per_epoch = math.ceil(tr.col.size(0) / (mini_bs * accum))

@@ -109,7 +109,7 @@ class TRWSampler():
 
         return walks
 
-    def rw_true_backward(self, batch, n_walks=1, min_ts=None, max_ts=None, reverse=False, trim_missing=True, walk_len=None):
+    def true_reverse_rw(self, batch, n_walks=1, min_ts=None, max_ts=None, reverse=False, trim_missing=True, walk_len=None):
         '''
         I realized that the reverse argument passed to temporal_rw just made the time stamps reversed, and
         didn't reverse the direction of the walks, so I fixed that here. It made the results much worse...

@@ -193,6 +193,8 @@ def print_paper_table(agg, how, select_key, expected_n):
                 rows.append([exp, f'wl{wl}', '-', '-', f'0/{expected_n}'])
                 continue
             variant = 'CyberGFM_T' if 'temporal' in exp else 'CyberGFM_S'
+            if '-gpt-' in exp:   # lp-gpt-static, cls-gpt-temporal, ... (run_all_hpc.sh --gpt)
+                variant += ', GPT'
             if exp.endswith('-rand'):
                 variant += ', random init'
             rows.append([f'{variant} ({exp})', f'wl{wl}',
@@ -244,7 +246,7 @@ def write_csv(path, agg, metrics, expected_n):
     for m in metrics:
         fields += [m, f'{m}_se']
     with open(path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore', delimiter='\t')
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore', delimiter=',')
         w.writeheader()
         for (exp, ds, wl) in sorted(agg, key=lambda k: (k[1], k[0], k[2])):
             r = agg[(exp, ds, wl)]

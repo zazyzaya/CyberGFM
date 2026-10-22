@@ -38,11 +38,11 @@ if __name__ == '__main__':
     ap.add_argument('--ignore-edge-feats', action='store_true')
     ap.add_argument('--walk-len', type=int, default=4)
     ap.add_argument('--delta', type=int, help='temporal walk window (seconds); default 1 day (0 for UNSW)')
-    ap.add_argument('--epochs', type=int, default=32)
-    ap.add_argument('--warmup-epochs', type=float, help='default: epochs / 3.75')
+    ap.add_argument('--epochs', type=int, default=10)
+    ap.add_argument('--warmup-epochs', type=float, help='default: epochs / 3.33')
     ap.add_argument('--eval-every', type=int, default=1, help='epochs')
-    ap.add_argument('--lr', type=float, default=3e-4)
-    ap.add_argument('--wd', type=float, default=0.02)
+    ap.add_argument('--lr', type=float, default=3e-5)
+    ap.add_argument('--wd', type=float, default=0.0)
     ap.add_argument('--mini-bs', type=int)
     ap.add_argument('--eval-bs', type=int)
     ap.add_argument('--select-by', choices=['auc', 'ap'], default='auc')
@@ -68,7 +68,7 @@ if __name__ == '__main__':
     delta = args.delta if args.delta is not None else (0 if kind == 'unsw' else DAY)
     mini_bs = args.mini_bs or (512 if args.size == 'baseline' else 1024)
     eval_bs = args.eval_bs or (2048 if kind == 'optc' else 1024)
-    warmup_epochs = args.epochs / 3.75 if args.warmup_epochs is None else args.warmup_epochs
+    warmup_epochs = args.epochs / 3.33 if args.warmup_epochs is None else args.warmup_epochs
     accum = math.ceil(BS / mini_bs)
 
     tr_data = load_train_graph(name, edge_features, args.poison, args.tr_size)
@@ -80,7 +80,7 @@ if __name__ == '__main__':
         path = args.model_fname or gpt_pretrained_path(name, args.size, args.trw, args.poison,
                                                        args.tr_size, best=args.best_pretrained, tag=args.pretrain_tag)
         print('Loading', path)
-        sd = torch.load(path, weights_only=True)
+        sd = torch.load(path, weights_only=True, map_location='cpu')
     p = SIZES[args.size]
     config = gpt_config(tr.num_tokens, p.H, p.L, 1024 if kind == 'lanl' else 512)
     model = GPT_Cls(config, sd, device=device, from_random=args.from_random, freeze=args.freeze)

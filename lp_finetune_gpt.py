@@ -74,7 +74,7 @@ if __name__ == '__main__':
         path = args.model_fname or gpt_pretrained_path(name, args.size, args.trw, args.poison,
                                                        args.tr_size, best=args.best_pretrained, tag=args.pretrain_tag)
         print('Loading', path)
-        model.load_state_dict(torch.load(path, weights_only=True))
+        model.load_state_dict(torch.load(path, weights_only=True, map_location='cpu'))
     model = model.to(device)
 
     updates_per_epoch = math.ceil(tr.col.size(0) / (mini_bs * accum))

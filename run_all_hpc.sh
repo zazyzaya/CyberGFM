@@ -23,6 +23,10 @@
 #   ./run_all_hpc.sh --force              # ignore existing checkpoints and results; redo everything
 #   WLS=4 ./run_all_hpc.sh --random       # the from-random-init control: fine-tune only, no
 #                                         # pretraining; one run per PSEED, seeded by it
+#   ./run_all_hpc.sh --gpt                # the causal (GPT) ablation: pretrain_gpt.py and the
+#                                         # *_finetune_gpt.py scripts, rw_gpt_* checkpoints,
+#                                         # results under lp-gpt-*/cls-gpt-*, gpt_ job names.
+#                                         # Combines with --force, --random and the env vars above.
 #
 # Run from the repo root on the submit host (login01/login02).
 set -uo pipefail
@@ -54,7 +58,7 @@ REPO=${REPO:-$PWD}
 
 # ---- EXPERIMENT MATRIX -- identical to run_main_seeds.sh ---------------------------------------
 PSEEDS=${PSEEDS:-"1 2 3 4 5"}
-DATASETS=${DATASETS:-"lanl14argus-dirtyts lanl14argus-cleants lanl14argus lanl14argus-ts optc-argus optc unsw"}
+DATASETS=${DATASETS:-"lanl14argus-dirtyts lanl14argus-cleants lanl14argus lanl14argus-ts optc optc-argus unsw"}
 MODES=${MODES:-"static temporal"}
 WLS=${WLS:-"1 2 4 8"}        # or WLS=match for the pretraining walk length per dataset
 SIZE=${SIZE:-tiny}
@@ -64,7 +68,7 @@ LOGDIR=${LOGDIR:-logs/lsf}
 RESULTS=${RESULTS:-results}     # where fine-tune CSVs go (passed as --out-dir) and are looked for
 PRETRAINED=${PRETRAINED:-pretrained}
 
-DRY=0; LIST_ONLY=0; PREFLIGHT=0; PREFLIGHT_ONLY=0; FORCE=0; RANDOM_INIT=0
+DRY=0; LIST_ONLY=0; PREFLIGHT=0; PREFLIGHT_ONLY=0; FORCE=0; RANDOM_INIT=0; GPT=0
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
@@ -73,10 +77,16 @@ for a in "$@"; do
     --no-preflight) PREFLIGHT=0 ;;
     --force) FORCE=1 ;;   # resubmit every cell, overwriting checkpoints and results CSVs
     --random) RANDOM_INIT=1 ;;   # fine-tune from random init (--from-random); no pretraining
+    --gpt) GPT=1 ;;              # causal variant: *_gpt.py scripts, checkpoints, results, job names
     *) echo "unknown option: $a" >&2; exit 1 ;;
   esac
 done
 [ -f "$REPO/pretrain.py" ] || { echo "no pretrain.py in $REPO -- run from the repo root or set REPO" >&2; exit 1; }
+if [ "$GPT" = 1 ]; then
+  for f in pretrain_gpt.py lp_finetune_gpt.py cls_finetune_gpt.py; do
+    [ -f "$REPO/$f" ] || { echo "--gpt: no $f in $REPO" >&2; exit 1; }
+  done
+fi
 command -v bsub >/dev/null || { echo "bsub not found; run this on login01/login02" >&2; exit 1; }
 
 # ---- per-dataset settings ---------------------------------------------------------------------
@@ -88,16 +98,22 @@ pt_args()     { case "$1" in
                   lanl*)          echo "--n-tokens 10" ;;
                   *)              echo "" ;;
                 esac; }
-ft_script()   { case "$1" in optc*) echo cls_finetune.py ;; *) echo lp_finetune.py ;; esac; }
+# --gpt swaps in the causal scripts. Their defaults already write to results/{lp,cls}-gpt-<mode>/
+# and pretrained/<mode>/<ds>/{t}rw_gpt_*, so the BERT and GPT runs never share a file or a job name.
+ARCH=bert; SFX=""; KSFX=""; JT=""
+[ "$GPT" = 1 ] && { ARCH=gpt; SFX=_gpt; KSFX=-gpt; JT=gpt_; }
+pt_script()   { echo "pretrain${SFX}.py"; }
+ft_script()   { case "$1" in optc*) echo "cls_finetune${SFX}.py" ;; *) echo "lp_finetune${SFX}.py" ;; esac; }
 ft_kind()     { case "$1" in optc*) echo cls ;; *) echo lp ;; esac; }
+res_dir()     { echo "$RESULTS/$(ft_kind "$1")${KSFX}-$2/$1"; }   # e.g. results/lp-gpt-static/lanl14argus
 pt_walk_len() { case "$1" in lanl*) echo 4 ;; *) echo 64 ;; esac; }
 wls_for()     { if [ "$WLS" = match ]; then pt_walk_len "$1"; else echo "$WLS"; fi; }
 
-ckpt_path() { local pre=rw_bert; [ "$2" = temporal ] && pre=trw_bert
+ckpt_path() { local pre=rw_$ARCH; [ "$2" = temporal ] && pre=trw_$ARCH
               echo "$PRETRAINED/$2/$1/${pre}_${1}_ps${3}_${SIZE}.pt"; }
 # rand_init_ is the prefix lp_finetune.py / cls_finetune.py put on --from-random results
 csv_path()  { local pre=""; [ "$RANDOM_INIT" = 1 ] && pre=rand_init_
-              echo "$RESULTS/$(ft_kind "$1")-$2/$1/${pre}$(ft_kind "$1")_ps${3}_${SIZE}_wl${4}_ps${3}_s0.csv"; }
+              echo "$(res_dir "$1" "$2")/${pre}$(ft_kind "$1")_ps${3}_${SIZE}_wl${4}_ps${3}_s0.csv"; }
 
 mkdir -p "$LOGDIR"
 
@@ -227,7 +243,7 @@ for ds in $DATASETS; do
     trw=""; [ "$mode" = temporal ] && trw="--trw"
     for s in $PSEEDS; do
       ck=$(ckpt_path "$ds" "$mode" "$s")
-      ptname="pt_${mode}_${ds}_ps${s}"
+      ptname="pt_${JT}${mode}_${ds}_ps${s}"
       if [ "$RANDOM_INIT" = 1 ]; then
         :                                  # no pretraining: the fine-tune starts from random init
       elif [ "$FORCE" = 0 ] && [ -f "$REPO/$ck" ]; then
@@ -240,7 +256,7 @@ for ds in $DATASETS; do
         # [ -f $ck ] guard skips them rather than silently fine-tuning the OLD model.
         clear=""; [ "$FORCE" = 1 ] && clear="rm -f $ck ${ck%.pt}-best.pt;"
         jid=$(submit "$ptname" "$QUEUE_PT" "$WALL_PT" "" $clear \
-          python pretrain.py --dataset "$ds" $trw --size "$SIZE" --device 0 \
+          python "$(pt_script)" --dataset "$ds" $trw --size "$SIZE" --device 0 \
                  --seed "$s" --tag "_ps${s}" $(pt_args "$ds") $EXTRA_PRETRAIN) || continue
         PT_JOBID["$ptname"]=$jid
         n_pt=$((n_pt + 1))
@@ -251,13 +267,13 @@ for ds in $DATASETS; do
         if [ "$FORCE" = 0 ] && [ -f "$REPO/$csv" ] && grep -q '^# BEST' "$REPO/$csv" 2>/dev/null; then
           ft_have=$((ft_have + 1)); continue
         fi
-        ftname="ft_${mode}_${ds}_ps${s}_wl${wl}"
+        ftname="ft_${JT}${mode}_${ds}_ps${s}_wl${wl}"
         # From random init: no checkpoint to wait for or check, and the seed must vary per run --
         # with every run at --seed 0 the five "seeds" would be the same run five times.
         guard="[ -f $ck ] || { echo 'no checkpoint $ck -- pretraining did not finish; skipping'; exit 0; };"
         ft_seed=0; init=""
         if [ "$RANDOM_INIT" = 1 ]; then
-          ftname="ft_rand_${mode}_${ds}_ps${s}_wl${wl}"; guard=""; ft_seed=$s; init="--from-random"
+          ftname="ft_${JT}rand_${mode}_${ds}_ps${s}_wl${wl}"; guard=""; ft_seed=$s; init="--from-random"
         fi
         if [ "$LIST_ONLY" = 1 ]; then
           echo "  finetune  $ftname"; n_ft=$((n_ft + 1)); continue
@@ -270,7 +286,7 @@ for ds in $DATASETS; do
         submit "$ftname" "$QUEUE_FT" "$WALL_FT" "${PT_JOBID[$ptname]-}" $clear "$guard" \
           python "$(ft_script "$ds")" --dataset "$ds" $trw --size "$SIZE" --device 0 \
                  --walk-len "$wl" --seed "$ft_seed" --pretrain-tag "_ps${s}" --tag "_ps${s}_s0" \
-                 --out-dir "$RESULTS/$(ft_kind "$ds")-$mode/$ds" $init $EXTRA_FT >/dev/null || true
+                 --out-dir "$(res_dir "$ds" "$mode")" $init $EXTRA_FT >/dev/null || true
         n_ft=$((n_ft + 1))
       done
     done
@@ -278,6 +294,7 @@ for ds in $DATASETS; do
 done
 
 echo
+echo "model       : $ARCH$([ "$RANDOM_INIT" = 1 ] && echo ', from random init')"
 echo "pretrainings: $n_pt submitted to $QUEUE_PT, $pt_have already have a checkpoint"
 echo "fine-tunes  : $n_ft submitted to $QUEUE_FT, $ft_have already finished"
 if [ "$WLS" = match ]; then

@@ -8,6 +8,12 @@ static GNN baselines); --no-dedup keeps the multigraph. Snapshots are processed 
 backprop through time, one optimizer step per piece). For temporal splits the GRU runs on past
 the training window over the observed val/test graph; see baseline_common.Timeline.
 
+On OpTC, messages propagate over the undirected view of each snapshot by default (--directed to
+turn it off). optc-argus's split files hold both directions of every edge in the training window
+but only one in the test window (check_symmetry.py), so a directed GCN embeds test snapshots from
+a graph shaped unlike anything it trained on. Argus's OpTC script propagates undirected for the
+same reason; the loss and the scored edges stay directed either way.
+
     python euler_test.py --dataset lanl14argus --device 0 --seed 1
     python euler_test.py --dataset optc-argus --device 0 --seed 1
 '''
@@ -19,7 +25,7 @@ from torch.optim import Adam
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import add_remaining_self_loops
 
-from baseline_common import (Selector, Timeline, arguments, finish, load_splits, local_pairs,
+from baseline_common import (Selector, Timeline, arguments, dataset_kind, finish, load_splits, local_pairs,
                              log_epoch, random_pairs, run, test_days, test_metrics, to_undirected,
                              val_auc)
 
@@ -120,8 +126,10 @@ if __name__ == '__main__':
     ap.add_argument('--epochs', type=int, default=100)
     ap.add_argument('--patience', type=int, default=10)
     ap.add_argument('--bs', type=int, default=32, help='snapshots per piece; 0 = all at once')
-    ap.add_argument('--undirected', action='store_true',
-                    help='propagate messages both ways (loss and scores stay on directed edges)')
+    ap.add_argument('--undirected', dest='undirected', action='store_true', default=None,
+                    help='propagate messages both ways (loss and scores stay on directed edges). '
+                         'Default: on for OpTC, off elsewhere, as in the Argus scripts')
+    ap.add_argument('--directed', dest='undirected', action='store_false')
     ap.add_argument('--no-dedup', action='store_true',
                     help='keep repeated (src, dst) rows within a snapshot. By default each snapshot '
                          'is a simple graph (as gnn_test.py and the Argus scripts use); with the '
@@ -135,6 +143,11 @@ if __name__ == '__main__':
                     help='snapshots: every bucket any split touches, or (the original scripts) '
                          'only buckets with a training edge, dropping val/test edges elsewhere')
     args = finish(ap.parse_args())
+    if args.undirected is None:
+        # optc-argus's training window carries both directions of every edge (load_argus_data.py
+        # adds reverses before the attack only) and its test window does not. Propagating over the
+        # directed graph would embed the test window from a differently shaped graph than training.
+        args.undirected = dataset_kind(args.dataset) == 'optc'
 
     tr, va, te, n, temporal = load_splits(args.dataset, args.data)
     tl = Timeline(tr, va, te, args.ts_div, temporal, axis_from=args.axis)

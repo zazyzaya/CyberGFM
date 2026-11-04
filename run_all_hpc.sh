@@ -58,7 +58,7 @@ REPO=${REPO:-$PWD}
 
 # ---- EXPERIMENT MATRIX -- identical to run_main_seeds.sh ---------------------------------------
 PSEEDS=${PSEEDS:-"1 2 3 4 5"}
-DATASETS=${DATASETS:-"lanl14argus-dirtyts lanl14argus-cleants lanl14argus lanl14argus-ts optc optc-argus unsw"}
+DATASETS=${DATASETS:-"lanl14argus-dirtyts lanl14argus-cleants lanl14argus lanl14argus-ts"}
 MODES=${MODES:-"static temporal"}
 WLS=${WLS:-"1 2 4 8"}        # or WLS=match for the pretraining walk length per dataset
 SIZE=${SIZE:-tiny}
@@ -101,6 +101,9 @@ pt_args()     { case "$1" in
 # --gpt swaps in the causal scripts. Their defaults already write to results/{lp,cls}-gpt-<mode>/
 # and pretrained/<mode>/<ds>/{t}rw_gpt_*, so the BERT and GPT runs never share a file or a job name.
 ARCH=bert; SFX=""; KSFX=""; JT=""
+# Non-default model sizes carry the size in job names (pt_static_lanl14argus_mini_ps1), so their
+# logs and job scripts never overwrite the tiny runs' and `bkill -J` can target one size.
+ST=""; [ "$SIZE" != tiny ] && ST="_${SIZE}"
 [ "$GPT" = 1 ] && { ARCH=gpt; SFX=_gpt; KSFX=-gpt; JT=gpt_; }
 pt_script()   { echo "pretrain${SFX}.py"; }
 ft_script()   { case "$1" in optc*) echo "cls_finetune${SFX}.py" ;; *) echo "lp_finetune${SFX}.py" ;; esac; }
@@ -243,7 +246,7 @@ for ds in $DATASETS; do
     trw=""; [ "$mode" = temporal ] && trw="--trw"
     for s in $PSEEDS; do
       ck=$(ckpt_path "$ds" "$mode" "$s")
-      ptname="pt_${JT}${mode}_${ds}_ps${s}"
+      ptname="pt_${JT}${mode}_${ds}${ST}_ps${s}"
       if [ "$RANDOM_INIT" = 1 ]; then
         :                                  # no pretraining: the fine-tune starts from random init
       elif [ "$FORCE" = 0 ] && [ -f "$REPO/$ck" ]; then
@@ -267,13 +270,13 @@ for ds in $DATASETS; do
         if [ "$FORCE" = 0 ] && [ -f "$REPO/$csv" ] && grep -q '^# BEST' "$REPO/$csv" 2>/dev/null; then
           ft_have=$((ft_have + 1)); continue
         fi
-        ftname="ft_${JT}${mode}_${ds}_ps${s}_wl${wl}"
+        ftname="ft_${JT}${mode}_${ds}${ST}_ps${s}_wl${wl}"
         # From random init: no checkpoint to wait for or check, and the seed must vary per run --
         # with every run at --seed 0 the five "seeds" would be the same run five times.
         guard="[ -f $ck ] || { echo 'no checkpoint $ck -- pretraining did not finish; skipping'; exit 0; };"
         ft_seed=0; init=""
         if [ "$RANDOM_INIT" = 1 ]; then
-          ftname="ft_${JT}rand_${mode}_${ds}_ps${s}_wl${wl}"; guard=""; ft_seed=$s; init="--from-random"
+          ftname="ft_${JT}rand_${mode}_${ds}${ST}_ps${s}_wl${wl}"; guard=""; ft_seed=$s; init="--from-random"
         fi
         if [ "$LIST_ONLY" = 1 ]; then
           echo "  finetune  $ftname"; n_ft=$((n_ft + 1)); continue

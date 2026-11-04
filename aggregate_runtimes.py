@@ -9,6 +9,9 @@ Reads the LSF report at the top of each .out ("Subject: Job N: <name> ... Done|E
     pt_[gpt_]<static|temporal>_<dataset>_ps<s>   CyberGFM pretraining, BERT or GPT  (logs/lsf)
     ft_[gpt_][rand_]<mode>_<dataset>_ps<s>_wl<w> CyberGFM fine-tuning               (logs/lsf)
 
+A pretraining token budget in the name (pt_static_lanl14argus_3e8_ps1, from run_ntokens.sh) goes
+in its own `tokens` column, so the budgets are averaged separately.
+
 LSF appends to -o files, so a resubmitted job leaves several reports in one .out; the LAST one
 is used, and the number of earlier attempts is counted. Only jobs that finished successfully
 are averaged by default (--include-failed to keep the rest); everything skipped is reported.
@@ -17,6 +20,7 @@ Text parsing only -- fine on the login node.
     python aggregate_runtimes.py                                  # logs/lsf logs/baselines logs/argus ...
     python aggregate_runtimes.py logs/baselines logs/argus --by method
     python aggregate_runtimes.py --by method phase dataset --csv runtimes.csv   # pool walk lengths
+    python aggregate_runtimes.py logs/ntokens --by mode tokens phase            # the token sweep
 '''
 import argparse
 import csv
@@ -35,7 +39,20 @@ RUNTIME = re.compile(r'Run time\s*:\s*([\d.]+) sec')
 EXITED = re.compile(r'Exited with exit code (\d+)')
 
 
+def split_tokens(dataset):
+    '''lanl14argus_3e8 (run_ntokens.sh) -> ('lanl14argus', '3e8'); anything else -> (dataset, '').'''
+    m = re.fullmatch(r'(.+)_(\d+e\d+)', dataset)
+    return (m[1], m[2]) if m else (dataset, '')
+
+
 def parse_name(name):
+    info = _parse_name(name)
+    if info is not None:
+        info['dataset'], info['tokens'] = split_tokens(info['dataset'])
+    return info
+
+
+def _parse_name(name):
     '''job name -> dict(method, phase, mode, dataset, wl, seed), or None if unrecognized.'''
     m = re.fullmatch(r'argus_(.+)_s(\d+)', name)
     if m:
@@ -88,8 +105,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('dirs', nargs='*',
                     default=['logs/lsf', 'logs/lsf-rand-e20', 'logs/baselines', 'logs/argus'])
-    ap.add_argument('--by', nargs='+', default=['source', 'method', 'phase', 'mode', 'dataset', 'wl'],
-                    choices=['source', 'method', 'phase', 'mode', 'dataset', 'wl'],
+    ap.add_argument('--by', nargs='+',
+                    default=['source', 'method', 'phase', 'mode', 'dataset', 'tokens', 'wl'],
+                    choices=['source', 'method', 'phase', 'mode', 'dataset', 'tokens', 'wl'],
                     help='columns to group by (source = the log directory)')
     ap.add_argument('--include-failed', action='store_true',
                     help='average every job with a run time, not just successful ones')
@@ -123,8 +141,9 @@ def main():
         groups[key].append(j['seconds'])
 
     rows = []
-    def order(key):   # numbers (walk length, seed) sort numerically, everything else as text
-        return tuple((0, int(k), '') if str(k).isdigit() else (1, 0, str(k)) for k in key)
+    def order(key):   # natural order: wl 2 before 10, 3e8 before 11e8
+        return tuple(tuple((0, int(t), '') if t.isdigit() else (1, 0, t)
+                           for t in re.split(r'(\d+)', str(k))) for k in key)
 
     for key in sorted(set(groups) | set(skipped), key=order):
         xs = groups.get(key, [])
@@ -161,7 +180,7 @@ def main():
             cw.writerows(rows)
         print(f'wrote {args.csv}')
     if args.jobs_csv:
-        fields = ['source', 'file', 'name', 'job', 'method', 'phase', 'mode', 'dataset', 'wl',
+        fields = ['source', 'file', 'name', 'job', 'method', 'phase', 'mode', 'dataset', 'tokens', 'wl',
                   'seed', 'status', 'ok', 'exit', 'seconds', 'attempts']
         with open(args.jobs_csv, 'w', newline='') as f:
             cw = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')

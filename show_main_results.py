@@ -23,6 +23,13 @@ the experiment does not have.
     python show_main_results.py --progress           # what is still running
     python show_main_results.py --csv main.csv
     python show_main_results.py --no-rand-init       # leave out the from-random-init controls
+    python show_main_results.py --root results-ntokens --table   # the pretraining-length sweep
+    python show_main_results.py --dataset lanl14argus --wl 4 --filter lp-static   # sizes: tiny vs
+                                                     # lp-static_mini / _med / _baseline rows
+
+Pretraining variants named in the file (the token budget from run_ntokens.sh, e.g. lp_1e8_ps1_tiny...,
+or a poisoning level) become their own experiment, `<experiment>_<variant>` (lp-static_1e8), so
+different budgets are never averaged together. The main runs carry no variant and are unchanged.
 
 Runs fine-tuned from random initialisation (lp_finetune.py --from-random, files named rand_init_*)
 are their own experiment, `<experiment>-rand` (e.g. lp-static-rand), so they sit next to the
@@ -63,6 +70,32 @@ def pt_wl(dataset):
 RAND_PREFIX = 'rand_init_'   # what lp_finetune.py / cls_finetune.py prepend under --from-random
 
 
+def variant_of(prefix, ps_re):
+    '''
+    What distinguishes this run's pretraining beyond its seed: the part of the file prefix left
+    after removing rand_init_, the lp/cls kind, the pretraining seed and the default model size
+    (tiny). Any other size stays, so each model size is its own cell.
+
+        lp_ps1_tiny          -> ''        (the main runs)
+        lp_ps1_mini          -> '_mini'   (run_sizes.sh)
+        lp_1e8_ps1_tiny      -> '_1e8'    (run_ntokens.sh)
+        lp_10poisoned_ps3_tiny -> '_10poisoned'
+
+    A non-empty variant is appended to the experiment name, so runs pretrained differently are
+    separate cells instead of being averaged together as if they were extra seeds.
+    '''
+    v = prefix[len(RAND_PREFIX):] if prefix.startswith(RAND_PREFIX) else prefix
+    v = re.sub(r'^(lp|cls)', '', v)
+    v = ps_re.sub('', v, count=1)
+    v = re.sub(r'_tiny$', '', v)
+    return v
+
+
+def nat(s):
+    '''Natural sort key: lp-static_3e8 before lp-static_11e8.'''
+    return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', str(s))]
+
+
 def collect(root, ps_re, filt=None, dataset=None, rand_init=True):
     '''(experiment, dataset, wl, pseed) -> list of runs, one per fine-tuning seed.'''
     runs, skipped = defaultdict(list), []
@@ -81,6 +114,7 @@ def collect(root, ps_re, filt=None, dataset=None, rand_init=True):
         if not ps:
             skipped.append(path)   # not part of the pretraining-seed matrix
             continue
+        exp += variant_of(m['prefix'], ps_re)
         seed = re.search(r'_s(\d+)$', m['tag'])
         rows, finished = read_run(path)
         runs[(exp, ds, int(m['wl']), int(ps[1]))].append(
@@ -154,7 +188,7 @@ def print_table(agg, show, how, select_key, expected_n):
     label = 'final epoch' if how == 'final' else f'best epoch by {select_key}'
     hdr = ['experiment', 'dataset', 'wl', 'n', 'epoch'] + list(show)
     lines = []
-    for (exp, ds, wl) in sorted(agg, key=lambda k: (k[1], k[0], k[2])):
+    for (exp, ds, wl) in sorted(agg, key=lambda k: (k[1], nat(k[0]), k[2])):
         r = agg[(exp, ds, wl)]
         star = '*' if wl == pt_wl(ds) else ''
         lines.append([exp, ds, f'{wl}{star}', f'{r["n"]}/{expected_n}',
@@ -167,7 +201,7 @@ def print_table(agg, show, how, select_key, expected_n):
     print(f'\n== {label} | mean ± SE over pretraining seeds ==')
     print('  '.join(h.ljust(x) for h, x in zip(hdr, w)))
     prev = None
-    for (exp, ds, wl), l in zip(sorted(agg, key=lambda k: (k[1], k[0], k[2])), lines):
+    for (exp, ds, wl), l in zip(sorted(agg, key=lambda k: (k[1], nat(k[0]), k[2])), lines):
         if prev is not None and (ds, exp) != prev:
             print()
         prev = (ds, exp)
@@ -187,7 +221,7 @@ def print_paper_table(agg, how, select_key, expected_n):
     for ds in datasets:
         wl = pt_wl(ds)
         rows = []
-        for exp in sorted({e for e, d, _ in agg if d == ds}):
+        for exp in sorted({e for e, d, _ in agg if d == ds}, key=nat):
             r = agg.get((exp, ds, wl))
             if r is None:
                 rows.append([exp, f'wl{wl}', '-', '-', f'0/{expected_n}'])
@@ -215,7 +249,7 @@ def print_progress(runs, cells, expected_n):
     '''Per cell: finished / started / expected, so an in-flight sweep is legible.'''
     print('\n== progress ==')
     keys = sorted({(e, d, w) for e, d, w, _ in runs} | {(e, d, w) for e, d, w, _ in cells},
-                  key=lambda k: (k[1], k[0], k[2]))
+                  key=lambda k: (k[1], nat(k[0]), k[2]))
     hdr = ['experiment', 'dataset', 'wl', 'finished', 'started', 'seeds done']
     lines = []
     for exp, ds, wl in keys:
@@ -231,7 +265,7 @@ def print_progress(runs, cells, expected_n):
 
 def print_per_seed(cells, show):
     print('\n== per pretraining seed ==')
-    keys = sorted(cells, key=lambda k: (k[1], k[0], k[2], k[3]))
+    keys = sorted(cells, key=lambda k: (k[1], nat(k[0]), k[2], k[3]))
     hdr = ['experiment', 'dataset', 'wl', 'ps', 'ft seeds'] + list(show)
     lines = [[e, d, str(w), f'ps{p}', str(cells[(e, d, w, p)]['_n_ft'])] +
              [fmt(m, cells[(e, d, w, p)].get(m)) for m in show] for e, d, w, p in keys]
@@ -246,9 +280,9 @@ def write_csv(path, agg, metrics, expected_n):
     for m in metrics:
         fields += [m, f'{m}_se']
     with open(path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore', delimiter=',')
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
-        for (exp, ds, wl) in sorted(agg, key=lambda k: (k[1], k[0], k[2])):
+        for (exp, ds, wl) in sorted(agg, key=lambda k: (k[1], nat(k[0]), k[2])):
             r = agg[(exp, ds, wl)]
             row = dict(experiment=exp, dataset=ds, walk_len=wl, n=r['n'],
                        n_expected=expected_n, epoch=r['_epoch'][0])

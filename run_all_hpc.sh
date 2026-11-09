@@ -58,9 +58,9 @@ REPO=${REPO:-$PWD}
 
 # ---- EXPERIMENT MATRIX -- identical to run_main_seeds.sh ---------------------------------------
 PSEEDS=${PSEEDS:-"1 2 3 4 5"}
-DATASETS=${DATASETS:-"lanl14argus-dirtyts lanl14argus-cleants lanl14argus lanl14argus-ts"}
+DATASETS=${DATASETS:-"lanl14argus optc unsw"}
 MODES=${MODES:-"static temporal"}
-WLS=${WLS:-"1 2 4 8"}        # or WLS=match for the pretraining walk length per dataset
+WLS=${WLS:-"1 2 3 4 5 6 7 8 9 10 12 14 16"}        # or WLS=match for the pretraining walk length per dataset
 SIZE=${SIZE:-tiny}
 EXTRA_PRETRAIN=${EXTRA_PRETRAIN:-""}
 EXTRA_FT=${EXTRA_FT:-""}

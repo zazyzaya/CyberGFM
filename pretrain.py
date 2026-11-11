@@ -19,7 +19,7 @@ from torch.optim import AdamW
 
 from common import (DAY, HOUR, PAD, SpeedTimer, bert_config, dataset_kind, evaluate, load_eval_samplers,
                     load_train_graph, make_lp_scorer, make_sampler, pretrained_path,
-                    run_tag, save_checkpoint, seed_everything, uses_edge_features)
+                    run_tag, save_checkpoint, seed_everything, uses_edge_features, walk_sampler)
 from models.gnn_bert import RWBert
 from tokenizer import RWTokenizer
 
@@ -61,6 +61,9 @@ if __name__ == '__main__':
     ap.add_argument('--device', type=int, default=0, help='-1 for CPU')
     ap.add_argument('--trw', action='store_true', help='temporally biased walks')
     ap.add_argument('--ignore-edge-feats', action='store_true')
+    ap.add_argument('--undirected-walks', action='store_true',
+                    help='pretrain on walks over the undirected training graph (every edge can be '
+                         'walked both ways); give the run its own --tag, e.g. _undir')
     ap.add_argument('--walk-len', type=int)
     ap.add_argument('--n-tokens', type=float, help='training length in units of 1e8 tokens')
     ap.add_argument('--mini-bs', type=int)
@@ -105,12 +108,15 @@ if __name__ == '__main__':
     stem = f'{"t" if args.trw else ""}rw_bert_{name}{run_tag(args.poison, args.tr_size)}{args.tag}_{args.size}'
 
     tr_data = load_train_graph(name, edge_features, args.poison, args.tr_size)
-    tr = make_sampler(tr_data, args.trw, edge_features, walk_len, mini_bs, device)
-    tr.n_walks = cfg['n_walks']
+    tr = make_sampler(tr_data, args.trw, edge_features, walk_len, mini_bs, device,
+                      undirected_walks=args.undirected_walks)
+    walk_src = walk_sampler(tr)  # tr itself unless --undirected-walks
+    tr.n_walks = walk_src.n_walks = cfg['n_walks']
     va, te = load_eval_samplers(name, args.trw, edge_features, walk_len, cfg['eval_bs'])
 
     print(f'{name}: edge features={edge_features}, walk_len={walk_len}, mini_bs={mini_bs} x{accum}, '
-          f'tokens={total:.1e}, vocab={int(tr.num_tokens)}')
+          f'tokens={total:.1e}, vocab={int(tr.num_tokens)}, '
+          f'walks={"undirected" if args.undirected_walks else "directed"}')
 
     tok = RWTokenizer(tr.x)
     tok.set_mask_rate(0)
@@ -137,7 +143,7 @@ if __name__ == '__main__':
     while tokens < total:
         model.train()
         timer.mark()
-        for mb in tr:  # walk sampling happens inside the iterator
+        for mb in walk_src:  # walk sampling happens inside the iterator
             if mb.size(0) == 0:
                 timer.mark()
                 continue

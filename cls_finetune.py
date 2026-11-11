@@ -35,6 +35,9 @@ if __name__ == '__main__':
     ap.add_argument('--device', type=int, default=0)
     ap.add_argument('--trw', action='store_true')
     ap.add_argument('--ignore-edge-feats', action='store_true')
+    ap.add_argument('--undirected-walks', action='store_true',
+                    help='draw the context walks on the undirected training graph. The edges that are '
+                         'fine-tuned on and the validation / test edges that are scored stay directed')
     ap.add_argument('--walk-len', type=int, default=4)
     ap.add_argument('--delta', type=int, help='temporal walk window (seconds); default 1 day (0 for UNSW)')
     ap.add_argument('--epochs', type=int, default=10)
@@ -70,7 +73,8 @@ if __name__ == '__main__':
     accum = math.ceil(BS / mini_bs)
 
     tr_data = load_train_graph(name, edge_features, args.poison, args.tr_size)
-    tr = make_sampler(tr_data, args.trw, edge_features, args.walk_len, mini_bs, device)
+    tr = make_sampler(tr_data, args.trw, edge_features, args.walk_len, mini_bs, device,
+                      undirected_walks=args.undirected_walks)
     va, te = load_eval_samplers(name, args.trw, edge_features, args.walk_len, eval_bs)
 
     sd = None
@@ -96,7 +100,7 @@ if __name__ == '__main__':
             f'_{args.size}_wl{args.walk_len}{args.tag}')
     tracker = ResultTracker(f'{out_dir}/{stem}.csv', args.select_by)
     print(f'{name}: edge features={edge_features}, delta={delta}, mini_bs={mini_bs} x{accum}, '
-          f'{total_steps} updates')
+          f'{total_steps} updates, walks={"undirected" if args.undirected_walks else "directed"}')
 
     def run_eval(epoch, updates):
         model.eval()

@@ -19,6 +19,7 @@ from metrics import detection_metrics
 from models.gnn_bert import GNNEmbedding
 from poison_datasets import poison
 from sampler import TRWSampler, RWSampler
+from torch_geometric.data import Data
 from utils import reindex
 
 PAD, MASK, OFFSET = GNNEmbedding.PAD, GNNEmbedding.MASK, GNNEmbedding.OFFSET
@@ -103,9 +104,58 @@ def load_train_graph(name, edge_features, poison_pct=0, tr_size=1.0):
     return tr
 
 
-def make_sampler(data, temporal, edge_features, walk_len, batch_size, device='cpu'):
+def undirected_walk_graph(data):
+    '''
+    The graph random walks move on under --undirected-walks: every edge (u, v, t, features) can
+    also be walked as (v, u, t, features), so a walk can leave a node along its in-edges as well
+    as its out-edges. A self-loop is its own reverse and is not added twice.
+
+    Returns a new CSR graph (rows sorted by timestamp, which the temporal walk requires) and
+    leaves `data` untouched. Only walks use it: the edges that are fine-tuned on and scored
+    still come from the directed graphs.
+    '''
+    n = data.x.size(0)
+    idxptr, col, ts = data.idxptr.cpu(), data.col.cpu(), data.ts.cpu()
+    src = torch.arange(n).repeat_interleave(idxptr[1:] - idxptr[:-1])
+    rev = src != col
+
+    s, d, t = torch.cat([src, col[rev]]), torch.cat([col, src[rev]]), torch.cat([ts, ts[rev]])
+    order = torch.argsort(t, stable=True)
+    order = order[torch.argsort(s[order], stable=True)]       # by source, then by time
+
+    ptr = torch.zeros(n + 1, dtype=torch.long)
+    ptr[1:] = torch.bincount(s, minlength=n).cumsum(0)
+    out = Data(x=data.x, idxptr=ptr, col=d[order], src=s[order], ts=t[order])
+    ea = data.get('edge_attr', None)
+    if ea is not None:
+        ea = ea.cpu()
+        out.edge_attr = torch.cat([ea, ea[rev]])[order]
+    if 'num_tokens' in data.keys():
+        out.num_tokens = data.num_tokens
+    return out
+
+
+def make_sampler(data, temporal, edge_features, walk_len, batch_size, device='cpu', undirected_walks=False):
+    '''
+    undirected_walks: sample every random walk (pretraining walks and fine-tuning / evaluation
+    context) on undirected_walk_graph(data), held as sampler.walker. The sampler's own edges --
+    what edge_iter() fine-tunes on and what random_edges() draws from -- stay the directed ones.
+    '''
     cls = TRWSampler if temporal else RWSampler
-    return cls(data, walk_len=walk_len, batch_size=batch_size, device=device, edge_features=edge_features)
+    sampler = cls(data, walk_len=walk_len, batch_size=batch_size, device=device, edge_features=edge_features)
+    if undirected_walks:
+        und = undirected_walk_graph(data)
+        sampler.walker = cls(und, walk_len=walk_len, batch_size=batch_size, device=device,
+                             edge_features=edge_features)
+        deg, und_deg = data.idxptr[1:] - data.idxptr[:-1], und.idxptr[1:] - und.idxptr[:-1]
+        print(f'Undirected walks: {data.col.size(0):,} directed edges -> {und.col.size(0):,} walkable; '
+              f'nodes a walk can leave: {int((deg > 0).sum()):,} -> {int((und_deg > 0).sum()):,}')
+    return sampler
+
+
+def walk_sampler(sampler):
+    '''The sampler that random walks are drawn from (see make_sampler).'''
+    return getattr(sampler, 'walker', sampler)
 
 
 def load_eval_samplers(name, temporal, edge_features, walk_len, eval_bs):
@@ -159,6 +209,7 @@ def context(tr, src, ts, delta, use_walk):
 
     Temporal walks look in [ts - delta, ts], clamped to the end of the training
     graph so edges after the training cutoff still get context.
+    Under --undirected-walks the walk is drawn on the undirected training graph.
     With edge features, the all-PAD feature block trailing src is removed so the
     scored edge's features sit directly after src (as in pretraining).
     '''
@@ -170,7 +221,7 @@ def context(tr, src, ts, delta, use_walk):
     max_ts = ts.long().clamp(max=tr._ts_max)
     min_ts = (max_ts - delta).clamp(min=0)
 
-    rw = tr.rw(src, max_ts=max_ts, min_ts=min_ts, reverse=True, trim_missing=False)
+    rw = walk_sampler(tr).rw(src, max_ts=max_ts, min_ts=min_ts, reverse=True, trim_missing=False)
     if tr.edge_features:
         rw = rw[:, :-tr.edge_attr.size(1)]
     return rw

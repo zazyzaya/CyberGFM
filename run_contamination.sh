@@ -27,6 +27,7 @@
 #   LANL_DAYS="8 10 12" ./run_contamination.sh
 #   OPTC_HOURS="24 48" ./run_contamination.sh --splits      # more OpTC windows (then rerun step 2)
 #   PARTS="cybergfm" ./run_contamination.sh                  # one family only (cybergfm argus baselines)
+#   PARTS=cybergfm MODES=temporal ./run_contamination.sh     # CyberGFM temporal walks only
 #
 # Run from the repo root on the login node; every step is a bsub job.
 set -uo pipefail
@@ -35,6 +36,7 @@ LANL_DAYS=${LANL_DAYS:-"8 9 10 11 12"}
 OPTC_BASE=${OPTC_BASE:-optc-argus}
 OPTC_HOURS=${OPTC_HOURS:-"24"}
 PARTS=${PARTS:-"cybergfm argus baselines"}
+MODES=${MODES:-"static temporal"}           # CyberGFM walk modes
 BASELINES=${BASELINES:-"euler,pikachu"}
 SEEDS=${SEEDS:-"1 2 3 4 5"}
 
@@ -111,8 +113,8 @@ fi
 for part in $PARTS; do
   case "$part" in
     cybergfm)
-      echo "=== CyberGFM (static + temporal, matched walk length, seeds: $SEEDS) ==="
-      DATASETS="${all_sets[*]}" MODES="static temporal" WLS=match PSEEDS="$SEEDS" \
+      echo "=== CyberGFM ($MODES, matched walk length, seeds: $SEEDS) ==="
+      DATASETS="${all_sets[*]}" MODES="$MODES" WLS=match PSEEDS="$SEEDS" \
       QUEUE="$QUEUE" LOGDIR="$LOGDIR/cybergfm" PRELUDE="$PRELUDE" \
         bash "$REPO/run_all_hpc.sh" "${PASS[@]}" ;;
     argus)

@@ -142,6 +142,9 @@ def arguments(description, *, beta, gamma, bs, undirected, arch='lanl'):
     g.add_argument('--tag', default='', help='variant suffix for the results file')
     g.add_argument('--cache', default='tmp', help='where built snapshots are cached')
     g.add_argument('--threads', type=int, default=0, help='torch.set_num_threads; 0 leaves it')
+    g.add_argument('--save-scores', action='store_true',
+                   help='save the selected epoch\'s per-edge test scores to '
+                        '<out-dir>/scores/<experiment><tag>_s<seed>.pt')
     g.add_argument('--bs', '--chunk', dest='bs', type=int, default=bs,
                    help='snapshots resident on the GPU at once (training and inference). One '
                         'optimizer step per epoch whatever this is; 0 = all of them')
@@ -233,8 +236,9 @@ def _scoring_embeddings(zs, prev, mode):
 
 
 @torch.no_grad()
-def evaluate(model, tr, va, te, *, temporal, mode, bs):
-    '''Validation (AUC, AP) for model selection, and the test metrics.'''
+def evaluate(model, tr, va, te, *, temporal, mode, bs, keep=None):
+    '''Validation (AUC, AP) for model selection, and the test metrics. keep: a dict that receives
+    the scored test rows (src, dst, label, score, weight) in scoring order.'''
     model.eval()
     dev = model.device
     zs_tr, h = embed(model, tr, bs)
@@ -253,15 +257,20 @@ def evaluate(model, tr, va, te, *, temporal, mode, bs):
         prev = zs_tr[-1]
     else:                                  # test snapshots share the training axis
         zs_te, prev = zs_tr, None
-    score, y, w = [], [], []
+    score, y, w, eis = [], [], [], []
     for i, z in enumerate(_scoring_embeddings(zs_te, prev, mode)):
         ei = te.ei[i]
         if z is None or ei.size(1) == 0:
             continue
         score.append(-model.decode(ei.to(dev), z.to(dev)).cpu())    # low probability = anomalous
         y.append(te.y[i])
+        eis.append(ei)
         if te.w is not None:
             w.append(te.w[i])
+    if keep is not None:
+        ei = torch.cat(eis, dim=1)
+        keep.update(src=ei[0], dst=ei[1], label=torch.cat(y), score=torch.cat(score),
+                    weight=torch.cat(w) if w else None)
     return va_auc, va_ap, test_metrics(torch.cat(y), torch.cat(score),
                                        torch.cat(w) if w else None, te.days())
 
@@ -330,7 +339,7 @@ class Selector:
                 'ap_snooped': self.snooped[1]['ap'], 'epoch_snooped': self.snooped[0]}
 
 
-def fit(args, tr, va, te, temporal):
+def fit(args, tr, va, te, temporal, scores_path=None):
     pos_len = max(ei.size(1) for ei in tr.ei)
     model = Argus(tr.num_nodes, tr.ea[0].size(1), args.h_dim, args.z_dim, args.gru_layers,
                   args.arch, args.margin, args.gamma, args.beta, args.undirected, args.max_pos,
@@ -340,9 +349,14 @@ def fit(args, tr, va, te, temporal):
     for e in range(args.epochs):
         t0 = time.time()
         loss = train_epoch(model, opt, tr, args.bs)
+        keep = {} if scores_path else None
         va_auc, va_ap, test = evaluate(model, tr, va, te, temporal=temporal,
-                                       mode=args.score_mode, bs=args.bs)
-        star = ' *' if sel.update(e, va_auc + va_ap, test) else ''
+                                       mode=args.score_mode, bs=args.bs, keep=keep)
+        improved = sel.update(e, va_auc + va_ap, test)
+        if improved and keep is not None:   # ends as the selected epoch's scores
+            os.makedirs(os.path.dirname(scores_path), exist_ok=True)
+            torch.save({**keep, 'epoch': e}, scores_path)
+        star = ' *' if improved else ''
         print(f'[{e}] {time.time() - t0:.0f}s loss {loss:.4f} | VAL AUC {va_auc:.4f} AP '
               f'{va_ap:.4f} | TEST AUC {test["auc"]:.4f} AP {test["ap"]:.4f} '
               f'P@r50 {test["prec_r50"]:.4f} FP/day {test["fp_day_r50"]:.0f}{star}', flush=True)
@@ -369,7 +383,9 @@ def run(args, tr, va, te, *, temporal, experiment, **record):
             seed_everything(seed)
         print(f'\n===== {experiment}, seed {seed} =====', flush=True)
         t0 = time.time()
-        res = fit(args, tr, va, te, temporal)
+        scores = (f'{args.out_dir}/scores/{experiment}{args.tag}_s{seed}.pt'
+                  if getattr(args, 'save_scores', False) else None)
+        res = fit(args, tr, va, te, temporal, scores_path=scores)
         row = dict(seed='' if seed is None else seed, dataset=experiment, **record,
                    split='temporal' if temporal else 'random',
                    **{k: getattr(args, k) for k in HYPER_ARGS},

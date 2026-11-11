@@ -58,7 +58,7 @@ REPO=${REPO:-$PWD}
 
 # ---- EXPERIMENT MATRIX -- identical to run_main_seeds.sh ---------------------------------------
 PSEEDS=${PSEEDS:-"1 2 3 4 5"}
-DATASETS=${DATASETS:-"lanl14argus optc unsw"}
+DATASETS=${DATASETS:-"optc unsw lanl14argus optc-argus lanl14argus-ts lanl14argus-dirtyts lanl14argus-cleants"}
 MODES=${MODES:-"static temporal"}
 WLS=${WLS:-"1 2 3 4 5 6 7 8 9 10 12 14 16"}        # or WLS=match for the pretraining walk length per dataset
 SIZE=${SIZE:-tiny}
@@ -109,8 +109,11 @@ pt_script()   { echo "pretrain${SFX}.py"; }
 ft_script()   { case "$1" in optc*) echo "cls_finetune${SFX}.py" ;; *) echo "lp_finetune${SFX}.py" ;; esac; }
 ft_kind()     { case "$1" in optc*) echo cls ;; *) echo lp ;; esac; }
 res_dir()     { echo "$RESULTS/$(ft_kind "$1")${KSFX}-$2/$1"; }   # e.g. results/lp-gpt-static/lanl14argus
-pt_walk_len() { case "$1" in lanl*) echo 4 ;; *) echo 64 ;; esac; }
-wls_for()     { if [ "$WLS" = match ]; then pt_walk_len "$1"; else echo "$WLS"; fi; }
+pt_walk_len() { case "$1" in lanl*) echo 4 ;; *) echo 64 ;; esac; }   # pretrain.py's defaults
+# WLS=match fine-tunes each dataset at the walk length its results are reported at: 4 on LANL and
+# OpTC, 16 on UNSW. OpTC and UNSW still PRETRAIN on 64-node walks (pretrain.py's default).
+ft_walk_len() { case "$1" in unsw*) echo 16 ;; optc*) echo 4 ;; *) pt_walk_len "$1" ;; esac; }
+wls_for()     { if [ "$WLS" = match ]; then ft_walk_len "$1"; else echo "$WLS"; fi; }
 
 ckpt_path() { local pre=rw_$ARCH; [ "$2" = temporal ] && pre=trw_$ARCH
               echo "$PRETRAINED/$2/$1/${pre}_${1}_ps${3}_${SIZE}.pt"; }
@@ -301,7 +304,7 @@ echo "model       : $ARCH$([ "$RANDOM_INIT" = 1 ] && echo ', from random init')"
 echo "pretrainings: $n_pt submitted to $QUEUE_PT, $pt_have already have a checkpoint"
 echo "fine-tunes  : $n_ft submitted to $QUEUE_FT, $ft_have already finished"
 if [ "$WLS" = match ]; then
-  echo "walk lengths: matched to pretraining -- $(for d in $DATASETS; do printf '%s=%s ' "$d" "$(pt_walk_len "$d")"; done)"
+  echo "fine-tune walk lengths (match): $(for d in $DATASETS; do printf '%s=%s ' "$d" "$(ft_walk_len "$d")"; done)"
 fi
 [ "$DRY" = 1 ] || [ "$LIST_ONLY" = 1 ] && exit 0
 

@@ -1,0 +1,2 @@
+Discovered a bug in the temporal RW sampler. Need to rerun all finetuning rounds. 
+Pretraining is unaffected. 
